@@ -1,0 +1,13 @@
+# Copie locale du SDK officiel (téléchargée par outils/recuperer-sdk-officiel.sh)
+sdk-officiel/
+
+# Secrets : clés API, mots de passe...
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Fichiers générés
+*.log
