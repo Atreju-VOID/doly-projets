@@ -31,10 +31,12 @@ L'utilisateur parle français : réponds, commente le code et écris la document
 - Vérifié sur le robot en v1.014 :
   - `doly_edge` : `High` au sol et `Low` en l'air, valable dès l'initialisation. Une surface sombre peut sembler être du vide.
   - `doly_tof` : voit de 2 à 20 cm environ, et renvoie -1 ou une erreur quand rien n'est à portée.
-  - `doly_battery` : `get_capacity()` renvoie 0 pendant environ 0,3 s après `init()`.
+  - `doly_battery` : `get_capacity()` renvoie 0 pendant environ 0,3 s après `init()`. La fin de décharge est brutale : 27 minutes de 30 % à la coupure, dont 5 seulement à partir de 16 %, robot à l'écoute. Aucune fonction n'indique si le robot charge.
   - `doly_arm` : le premier angle lu peut être faux (251° au repos). Les suivants sont justes.
   - `doly_drive` : un angle négatif le fait tourner vers sa gauche. `abort()` met les roues en état d'erreur.
 - Une fois le service Doly arrêté, rien ne pilote le ventilateur : appelle `fan.init(True)` dans toute appli qui tourne longtemps.
+- Mot d'éveil : un second reconnaisseur Vosk limité à une grammaire (`["hé dolly", "[unk]"]`) consomme 15 % d'un cœur. « Doly » seul se déclenche à tort, par exemple sur « joli » : il faut les deux mots. Il s'arrête souvent à la virgule après « Hé Doly » : garde le micro ouvert pour ne pas perdre la suite. `SetWords(True)` donne la fin exacte du mot, et permet de ne transcrire que ce qui suit, sans chercher « dolly » dans le texte, où il n'est pas toujours retrouvé.
+- Vosk 0.3.45 (celui du robot) : `SetEndpointerDelays` n'existe pas. Juste après `Result()`, `PartialResult()` renvoie `{"text": ""}`, sans champ `partial`. Le texte provisoire a du retard sur la parole, alors que le volume réagit tout de suite : au calme, le micro est vers 100 à 150 (valeur efficace, décalage continu retiré), et la voix le plus souvent au-dessus de 500. `Reset()` ne libère pas la mémoire : à l'écoute, elle monte d'environ 25 Mo pendant 10 minutes, puis Vosk reconstruit son traitement et elle ne monte plus.
 - Extensions : 6 GPIO, Qwiic/I2C sur `/dev/i2c-6` (les autres bus I2C sont internes), UART, USB, 2 sorties servo. Alimentation 5 V utilisateur : 1,5 A en continu.
 
 ## Règles pour le code qui tourne sur Doly
@@ -47,6 +49,18 @@ L'utilisateur parle français : réponds, commente le code et écris la document
 - Depuis le PC de l'utilisateur, Claude peut se connecter au robot avec la clé SSH dédiée : `ssh -i ~/.ssh/doly_ed25519 doly@doly`, ou l'adresse IP du robot si le nom ne répond pas. Préviens l'utilisateur avant de faire parler ou bouger le robot.
 - Tout nouveau mouvement passe d'abord par un test guidé, avec l'utilisateur à côté, comme dans `projets/doly-conversation/`. Le code qui fait rouler le robot passe par `Corps.rouler`, qui surveille le vide, les obstacles, les touchers et la durée.
 - Le service Doly repart tout seul au démarrage, et le robot installe aussi ses mises à jour à ce moment-là. Évite `apt upgrade` sur le robot : installe les paquets Python dans un environnement virtuel.
+- Si `doly-francais.service` est installé, il prend la main après chaque démarrage (voir `projets/doly-conversation/`). Arrête-le avant tout autre script qui utilise le matériel, le micro ou le son : `sudo systemctl stop doly-francais`.
+
+## Pièges vérifiés pour une appli qui tourne en permanence
+
+Tous ont été observés sur ce robot :
+
+- **Ordre de démarrage :** `doly_update.service` démarre après `multi-user.target`. Un service installé dans cette cible ne doit pas déclarer `After=doly_update.service` : la boucle d'ordre fait supprimer le service en silence au démarrage. Il faut attendre le service Doly depuis le programme.
+- **`/dev/shm` :** le système y efface les fichiers de l'utilisateur `doly` environ 10 s après la fermeture de sa dernière session, par exemple une connexion SSH (`RemoveIPC`). Un service utilise plutôt `RuntimeDirectory=`.
+- **Micro dans un tuyau :** `arecord` lancé avec `stdout=PIPE` peut se bloquer sur un tuyau plein si plus personne ne lit, et `wait()` ne revient alors jamais. Ferme `stdout` entre `terminate()` et `wait()`, sauf si un autre fil lit le tuyau jusqu'au bout.
+- **DNS :** sur ce réseau, les deux questions (IPv4 et IPv6) envoyées en même temps peuvent faire perdre 5 s. `RES_OPTIONS="single-request timeout:1"`, posé pour la seule appli, évite ce délai.
+- **Date :** l'horloge n'est pas à l'heure dans les premières secondes, et le robot peut rester allumé plusieurs jours. Lis la date à chaque appel, jamais une seule fois au lancement.
+- **Vérifier qu'une appli vit :** « service actif » ne suffit pas, un programme figé reste actif. Regarde dans le journal si ses messages réguliers continuent d'arriver, par exemple `[batterie]` toutes les minutes. Le journal survit aux redémarrages : `journalctl -b -1` montre la fin du démarrage précédent, à condition de se méfier de ses heures, car l'horloge repart de la dernière heure connue à l'allumage.
 
 ## Organisation du dépôt
 

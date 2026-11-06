@@ -7,12 +7,18 @@ Conversation en français avec Doly : tu touches, tu parles, Claude réfléchit,
 Pose un doigt sur un capteur au-dessus de ses yeux, parle après le bip, puis lève le doigt.
 Toucher Doly pendant qu'il parle ou bouge l'arrête. Dire « au revoir » termine la conversation.
 
+Avec --mains-libres, dis aussi « Hé Doly » pour lui parler. Le micro reste alors ouvert en permanence :
+le mot d'éveil est détecté sur le robot, et rien ne part sur Internet avant lui. Dis « ne m'écoute plus »
+pour fermer le micro jusqu'au prochain toucher, ou « reprends ta personnalité » pour rendre la main.
+
 Usage, sur le robot :
     ~/doly-env/bin/python converser.py
+    ~/doly-env/bin/python converser.py --mains-libres
     ~/doly-env/bin/python converser.py --modele claude-opus-5-5
 """
 
 import argparse
+import collections
 import json
 import os
 import queue
@@ -55,8 +61,28 @@ DUREE_MAX = 15  # secondes d'écoute au maximum
 FIN_DE_CONTACT = 0.3  # secondes sans contact avant d'arrêter d'écouter
 DUREE_MIN = 0.8  # en dessous, le doigt a sans doute été levé trop tôt
 ATTENTE_MAX = 300  # secondes sans toucher avant de rendre la main à sa personnalité d'origine
+ATTENTE_ORIGINE = 300  # secondes au maximum pour laisser démarrer le logiciel d'origine
 
-SYSTEME = f"""Tu es Doly, un petit robot de compagnie curieux, joyeux et un peu taquin. Tu parles avec les \
+# Mode mains libres. « Doly » seul se déclenche à tort, par exemple sur « joli » : on exige les deux mots.
+MOT_D_EVEIL = "hé dolly"
+MEMOIRE_EVEIL = 80  # blocs de 0,1 s gardés en mémoire vive, pour comprendre « Hé Doly, avance » d'une traite
+SILENCE_APRES_EVEIL = 5  # blocs de 0,1 s de silence de plus, après « Hé Doly », avant de conclure qu'il n'y a pas de suite
+VOLUME_PAROLE_MIN = 300  # mesuré sur le robot : le silence est vers 100 à 150, et la voix le plus souvent au-dessus de 500
+DELAI_APRES_EVEIL = 6  # secondes pour commencer à parler après le bip
+DELAI_SUITE = 5  # secondes pendant lesquelles il écoute sans mot d'éveil, juste après une réponse
+OUBLI = 600  # secondes sans échange avant de repartir d'une conversation neuve
+CONTROLE_BATTERIE = 60  # secondes entre deux lectures de la batterie
+# Mesuré sur une décharge, robot à l'écoute : à 30 %, il reste environ 25 minutes, puis la fin est brutale, avec
+# 5 minutes entre 16 % et la coupure. Une coupure peut abîmer la carte SD : mieux vaut s'éteindre trop tôt.
+BATTERIE_ALERTE = 30  # pour cent
+BATTERIE_EXTINCTION = 15  # pour cent : sa personnalité d'origine étant arrêtée, c'est à nous de l'éteindre à temps
+LECTURES_AVANT_EXTINCTION = 2  # la lecture varie de quelques pour cent : on attend qu'elle se confirme
+
+NE_PLUS_ECOUTER = re.compile(r"ne m'écoute plus|arrête d'écouter|coupe ton micro")
+REPRENDRE_PERSONNALITE = re.compile(r"reprends? ta personnalité")
+AU_REVOIR = re.compile(r"\bau revoir\b")
+
+SYSTEME = """Tu es Doly, un petit robot de compagnie curieux, joyeux et un peu taquin. Tu parles avec les \
 personnes de la maison, en français, et tu les tutoies. Reste bienveillant et adapté à toute la famille.
 
 Ce que tu écris est lu à voix haute par une synthèse vocale, alors écris comme on parle :
@@ -78,9 +104,14 @@ s'il reste une question à laquelle répondre.
 - Ne décris jamais tes gestes dans le texte.
 
 Pour l'instant, tu ne peux ni voir, ni aller sur Internet, et tu ne connais ni l'heure ni la météo. Si on te le \
-demande, dis-le simplement au lieu d'inventer. Nous sommes le {time.strftime("%d/%m/%Y")}."""
+demande, dis-le simplement au lieu d'inventer."""
 
 ACCUEIL = "Je t'écoute ! Pose un doigt au-dessus de mes yeux pour me parler."
+ACCUEIL_MAINS_LIBRES = "Je t'écoute ! Dis hé Doly pour me parler."
+JE_N_ECOUTE_PLUS = "D'accord, je n'écoute plus. Touche-moi pour me réveiller."
+JE_REPRENDS = "D'accord, je reprends ma personnalité habituelle. À bientôt !"
+BATTERIE_FAIBLE = "Ma batterie est faible. Pose-moi sur ma base, s'il te plaît."
+JE_M_ETEINS = "Ma batterie est presque vide. Je m'éteins."
 TROP_COURT = "Garde le doigt posé pendant que tu parles."
 RIEN_COMPRIS = "Je n'ai rien compris. Tu peux répéter ?"
 INACTIVITE = "Je ne sens plus personne. À bientôt !"
@@ -124,11 +155,18 @@ def nettoyer(phrase):
     return re.sub(r"[*_#`\U00010000-\U0010FFFF]", "", phrase).strip()
 
 
+def volume(bloc):
+    """Volume d'un bloc de son, sans le décalage continu du micro."""
+    return audioop.rms(audioop.bias(bloc, 2, -audioop.avg(bloc, 2)), 2)
+
+
 class Voix:
     """Piper reste chargé en mémoire. Les phrases sont calculées à l'avance, puis jouées à la suite."""
 
     def __init__(self):
-        self.dossier = tempfile.mkdtemp(dir="/dev/shm")
+        # En service, pas de /dev/shm : le système y efface les fichiers de l'utilisateur dès que sa dernière
+        # session se ferme, par exemple une connexion SSH. systemd fournit un dossier en mémoire qui n'a pas ce défaut.
+        self.dossier = tempfile.mkdtemp(dir=os.environ.get("RUNTIME_DIRECTORY", "/dev/shm"))
         self.piper = subprocess.Popen(
             [DOSSIER_PIPER + "/piper", "--model", VOIX, "--espeak_data", DOSSIER_PIPER + "/espeak-ng-data",
              "--output_dir", self.dossier, "--quiet"],
@@ -217,7 +255,106 @@ class Oreille:
     """Transcrit la parole avec Vosk pendant qu'elle est enregistrée."""
 
     def __init__(self):
-        self.reconnaisseur = KaldiRecognizer(Model(MODELE_VOSK), TAUX)
+        modele = Model(MODELE_VOSK)
+        self.reconnaisseur = KaldiRecognizer(modele, TAUX)
+        # Ce second reconnaisseur ne cherche que le mot d'éveil : il ne consomme que 15 % d'un cœur.
+        self.guetteur = KaldiRecognizer(modele, TAUX, json.dumps([MOT_D_EVEIL, "[unk]"], ensure_ascii=False))
+        self.guetteur.SetWords(True)  # pour savoir à quel moment du son se termine son nom
+        self.duree_guettee = 0.0  # secondes de son données au guetteur depuis sa création
+
+    def _ouvrir_micro(self):
+        return subprocess.Popen(
+            ["arecord", "-D", CARTE_SON, "-q", "-f", "S16_LE", "-r", str(TAUX), "-c", "1", "-t", "raw"],
+            stdout=subprocess.PIPE,
+        )
+
+    def _fermer_micro(self, arecord):
+        """Ferme le tuyau avant d'attendre : s'il est plein, arecord reste bloqué dessus et l'appli se fige pour toujours."""
+        arecord.terminate()
+        arecord.stdout.close()
+        arecord.wait()
+
+    def guetter(self, duree_max, au_reveil):
+        """Attend le mot d'éveil ou un toucher. Renvoie ("eveil", phrase qui suit), ("toucher", "") ou ("rien", "")."""
+        self.guetteur.Reset()
+        memoire = collections.deque(maxlen=MEMOIRE_EVEIL)
+        arecord = self._ouvrir_micro()
+        debut = time.monotonic()
+        try:
+            while True:
+                if capteur_touche():
+                    return "toucher", ""
+                bloc = arecord.stdout.read(TAILLE_BLOC)
+                if not bloc:
+                    print("[erreur] Le micro s'est fermé", flush=True)
+                    time.sleep(1)
+                    return "rien", ""
+                memoire.append(bloc)
+                self.duree_guettee += len(bloc) / (2 * TAUX)
+                if self.guetteur.AcceptWaveform(bloc):
+                    resultat = json.loads(self.guetteur.Result())
+                    if MOT_D_EVEIL in resultat["text"]:
+                        print(f"[eveil] {resultat['text']}", flush=True)
+                        au_reveil()
+                        nom = next(mot for mot in resultat["result"] if mot["word"] == MOT_D_EVEIL.split()[-1])
+                        return "eveil", self._transcrire_suite(memoire, self.duree_guettee - nom["end"], arecord)
+                    memoire.clear()  # ce qui n'était pas pour Doly n'est pas gardé
+                elif time.monotonic() - debut > duree_max and not json.loads(self.guetteur.PartialResult())["partial"]:
+                    return "rien", ""
+        finally:
+            self._fermer_micro(arecord)
+
+    def _transcrire_suite(self, memoire, duree_depuis_le_nom, arecord):
+        """Transcrit ce qui suit « Hé Doly », même après une courte pause. Renvoie "" s'il n'y a pas de suite."""
+        seuil = max(3 * min(map(volume, memoire)), VOLUME_PAROLE_MIN)
+        morceaux = []
+        # Ce qui a été dit avant son nom n'était pas pour lui : ce n'est même pas transcrit.
+        for bloc in list(memoire)[-max(1, round(duree_depuis_le_nom * 10)):]:  # des blocs de 0,1 s
+            if self.reconnaisseur.AcceptWaveform(bloc):
+                morceaux.append(json.loads(self.reconnaisseur.Result())["text"])
+        # Le guetteur s'arrête à la première pause, souvent la virgule après « Hé Doly » : la phrase continue sans doute.
+        # Le micro reste donc ouvert, et seul un court silence de plus conclut qu'il n'y a pas de suite. Les premiers mots
+        # tardent à apparaître dans le texte provisoire : le volume, lui, dit tout de suite si quelqu'un parle.
+        silence = 0
+        fin = time.monotonic() + DUREE_MAX
+        while not any(morceaux) and silence < SILENCE_APRES_EVEIL and time.monotonic() < fin:
+            bloc = arecord.stdout.read(TAILLE_BLOC)
+            if not bloc:
+                break
+            if self.reconnaisseur.AcceptWaveform(bloc):
+                morceaux.append(json.loads(self.reconnaisseur.Result())["text"])
+            # Juste après une fin de phrase, Vosk répond sans le champ « partial ».
+            parle = json.loads(self.reconnaisseur.PartialResult()).get("partial") or volume(bloc) > seuil
+            silence = 0 if parle else silence + 1
+        morceaux.append(json.loads(self.reconnaisseur.FinalResult())["text"])
+        return " ".join(m for m in morceaux if m)
+
+    def ecouter_jusqu_au_silence(self, delai):
+        """Écoute une phrase sans toucher. Renvoie ("phrase", texte), ("toucher", "") ou ("rien", "") si personne ne parle."""
+        arecord = self._ouvrir_micro()
+        debut = time.monotonic()
+        parole = False
+        try:
+            while True:
+                if capteur_touche():
+                    return "toucher", ""
+                bloc = arecord.stdout.read(TAILLE_BLOC)
+                if not bloc:
+                    return "rien", ""
+                if self.reconnaisseur.AcceptWaveform(bloc):
+                    texte = json.loads(self.reconnaisseur.Result())["text"]
+                    if texte:
+                        return "phrase", texte
+                    parole = False
+                elif json.loads(self.reconnaisseur.PartialResult())["partial"]:
+                    parole = True
+                ecoule = time.monotonic() - debut
+                if (not parole and ecoule > delai) or ecoule > DUREE_MAX:
+                    texte = json.loads(self.reconnaisseur.FinalResult())["text"]
+                    return ("phrase", texte) if texte else ("rien", "")
+        finally:
+            self._fermer_micro(arecord)
+            self.reconnaisseur.Reset()
 
     def rechauffer(self, fichier_wav):
         """La première phrase est bien plus lente : on la fait passer sur une phrase de synthèse."""
@@ -233,10 +370,7 @@ class Oreille:
         """Renvoie (texte compris, durée écoutée, instant où le doigt s'est levé)."""
         morceaux = []
         octets = 0
-        arecord = subprocess.Popen(
-            ["arecord", "-D", CARTE_SON, "-q", "-f", "S16_LE", "-r", str(TAUX), "-c", "1", "-t", "raw"],
-            stdout=subprocess.PIPE,
-        )
+        arecord = self._ouvrir_micro()
 
         def transcrire_en_direct():
             nonlocal octets
@@ -276,6 +410,9 @@ class Cerveau:
         self.corps = corps
         self.messages = []
         self.premier_mot = None
+
+    def oublier(self):
+        self.messages = []
 
     def repondre(self, texte, dire, actif):
         """Répond à une phrase. actif() devient faux si la réponse a été interrompue par un toucher."""
@@ -318,7 +455,8 @@ class Cerveau:
         with self.client.messages.stream(
             model=self.modele,
             max_tokens=MAX_TOKENS,
-            system=SYSTEME,
+            # La date est lue à chaque appel : Doly peut rester allumé plusieurs jours.
+            system=SYSTEME + time.strftime(" Nous sommes le %d/%m/%Y."),
             tools=OUTILS,
             messages=self.messages,
             output_config={"effort": EFFORT},
@@ -353,68 +491,183 @@ class Cerveau:
         dire(phrase)
 
 
-def converser(voix, oreille, cerveau, corps, attente):
-    voix.dire(ACCUEIL)
-    reflexion = None
-    while True:
-        debut = time.monotonic()
-        while not capteur_touche():
-            corps.passer_a("parole" if voix.parle() else "repos")
-            if time.monotonic() - debut > attente and not voix.parle():
-                voix.dire(INACTIVITE)
-                voix.attendre_fin()
-                return
-            time.sleep(0.05)
+class Conversation:
+    """Enchaîne l'écoute et les réponses. Un toucher coupe toujours Doly pour te donner la parole."""
 
-        voix.interrompre()
-        corps.arreter()
-        corps.passer_a("ecoute")
-        voix.jouer_bip()
-        texte, duree, doigt_leve = oreille.ecouter_tant_que_touche()
-        transcrit = time.monotonic()
-        corps.passer_a("reflexion")
+    def __init__(self, voix, oreille, cerveau, corps, discret=False):
+        self.voix = voix
+        self.oreille = oreille
+        self.cerveau = cerveau
+        self.corps = corps
+        self.discret = discret  # en service, le journal est gardé sur le disque : tes phrases n'y vont pas
+        self.reflexion = None
+        self.dernier_controle = time.monotonic()
+        self.lectures_critiques = 0
+        self.alerte_donnee = False
+
+    def noter(self, etiquette, texte):
+        print(f"[{etiquette}] {'(masqué)' if self.discret else texte}", flush=True)
+
+    def ecouter_au_toucher(self):
+        """Renvoie (texte compris, instant où le doigt s'est levé). Le texte est vide si rien n'est à envoyer."""
+        self.voix.interrompre()
+        self.corps.arreter()
+        self.corps.passer_a("ecoute")
+        self.voix.jouer_bip()
+        texte, duree, doigt_leve = self.oreille.ecouter_tant_que_touche()
+        self.corps.passer_a("reflexion")
         if duree < DUREE_MIN:
-            voix.dire(TROP_COURT)
-            continue
-        texte = re.sub(r"\bdolly\b", "Doly", texte, flags=re.IGNORECASE)
-        print(f"[toi] {duree:.1f} s : {texte}", flush=True)
+            self.voix.dire(TROP_COURT)
+            return "", doigt_leve
         if not texte:
-            voix.dire(RIEN_COMPRIS)
-            continue
+            self.voix.dire(RIEN_COMPRIS)
+        return texte, doigt_leve
+
+    def repondre(self, texte, fin_de_parole):
+        """Fait répondre Claude. Rend la main à la fin de la réponse, ou dès qu'un toucher l'interrompt."""
+        transcrit = time.monotonic()
+        texte = re.sub(r"\bdolly\b", "Doly", texte, flags=re.IGNORECASE)
+        self.noter("toi", texte)
 
         # Une réponse interrompue peut encore arriver : on l'attend pour garder l'historique en ordre.
-        if reflexion:
-            reflexion.join()
-        generation = voix.generation
-        voix.premier_son = None
-        reflexion = threading.Thread(
-            target=cerveau.repondre,
-            args=(texte, lambda phrase: voix.dire(nettoyer(phrase), generation), lambda: voix.generation == generation),
+        if self.reflexion:
+            self.reflexion.join()
+        generation = self.voix.generation
+        self.voix.premier_son = None
+        self.reflexion = threading.Thread(
+            target=self.cerveau.repondre,
+            args=(texte, lambda phrase: self.voix.dire(nettoyer(phrase), generation),
+                  lambda: self.voix.generation == generation),
             daemon=True,
         )
-        reflexion.start()
+        self.reflexion.start()
 
-        while (reflexion.is_alive() or voix.parle()) and not capteur_touche():
-            if voix.premier_son:
-                corps.passer_a("parole")
+        while (self.reflexion.is_alive() or self.voix.parle()) and not capteur_touche():
+            if self.voix.premier_son:
+                self.corps.passer_a("parole")
             time.sleep(0.05)
 
-        if voix.premier_son:
-            print(f"[mesure] doigt levé puis premier son : {voix.premier_son - doigt_leve:.2f} s "
-                  f"(transcription {transcrit - doigt_leve:.2f} s, premier mot de Claude "
-                  f"{cerveau.premier_mot or 0:.2f} s)", flush=True)
+        if self.voix.premier_son:
+            print(f"[mesure] fin de ta phrase puis premier son : {self.voix.premier_son - fin_de_parole:.2f} s "
+                  f"(transcription {transcrit - fin_de_parole:.2f} s, premier mot de Claude "
+                  f"{self.cerveau.premier_mot or 0:.2f} s)", flush=True)
 
-        if re.search(r"\bau revoir\b", texte, flags=re.IGNORECASE):
-            reflexion.join()
-            voix.attendre_fin()
-            return
+    def au_toucher(self, attente):
+        self.voix.dire(ACCUEIL)
+        while True:
+            debut = time.monotonic()
+            while not capteur_touche():
+                self.corps.passer_a("parole" if self.voix.parle() else "repos")
+                if time.monotonic() - debut > attente and not self.voix.parle():
+                    self.voix.dire(INACTIVITE)
+                    self.voix.attendre_fin()
+                    return
+                time.sleep(0.05)
+
+            texte, doigt_leve = self.ecouter_au_toucher()
+            if not texte:
+                continue
+            self.repondre(texte, doigt_leve)
+            if AU_REVOIR.search(texte):
+                self.reflexion.join()
+                self.voix.attendre_fin()
+                return
+
+    def surveiller(self):
+        """Contrôle régulier en mode mains libres. Renvoie True s'il faut éteindre le robot."""
+        if time.monotonic() - self.dernier_controle < CONTROLE_BATTERIE:
+            return False
+        self.dernier_controle = time.monotonic()
+        # Le logiciel d'origine ne doit pas revenir se disputer le matériel avec nous.
+        if service_doly_actif():
+            print("[info] Le service d'origine est revenu : je l'arrête", flush=True)
+            helper.stop_doly_service()
+        capacite = self.corps.batterie()
+        print(f"[batterie] {capacite} %", flush=True)
+        if capacite <= BATTERIE_ALERTE and not self.alerte_donnee:
+            self.voix.dire(BATTERIE_FAIBLE)
+            self.alerte_donnee = True
+        elif capacite > BATTERIE_ALERTE + 5:
+            self.alerte_donnee = False
+        self.lectures_critiques = self.lectures_critiques + 1 if capacite < BATTERIE_EXTINCTION else 0
+        return self.lectures_critiques >= LECTURES_AVANT_EXTINCTION
+
+    def mains_libres(self):
+        """Renvoie "personnalite" s'il faut rendre la main, ou "eteindre" si la batterie est presque vide."""
+        self.voix.dire(ACCUEIL_MAINS_LIBRES)
+        sourd = False  # micro fermé jusqu'au prochain toucher
+        suite = False  # juste après une réponse, il écoute sans mot d'éveil
+        dernier_echange = time.monotonic()
+        while True:
+            # Il n'écoute pas pendant qu'il parle : il s'entendrait lui-même.
+            while self.voix.parle() and not capteur_touche():
+                self.corps.passer_a("parole")
+                time.sleep(0.05)
+
+            if self.surveiller():
+                self.voix.dire(JE_M_ETEINS)
+                self.voix.attendre_fin()
+                return "eteindre"
+            if time.monotonic() - dernier_echange > OUBLI:
+                self.cerveau.oublier()
+
+            fin_de_parole = None
+            if capteur_touche():
+                evenement, texte = "toucher", ""
+            elif sourd:
+                self.corps.passer_a("repos")
+                time.sleep(0.05)
+                continue
+            elif suite:
+                self.corps.passer_a("ecoute")
+                evenement, texte = self.oreille.ecouter_jusqu_au_silence(DELAI_SUITE)
+                suite = False
+            else:
+                self.corps.passer_a("repos")
+                # Ses LED passent au vert dès qu'il a entendu son nom, avant même d'avoir compris la suite.
+                evenement, texte = self.oreille.guetter(CONTROLE_BATTERIE, lambda: self.corps.passer_a("ecoute"))
+                if evenement == "eveil" and not texte:
+                    self.voix.jouer_bip()
+                    evenement, texte = self.oreille.ecouter_jusqu_au_silence(DELAI_APRES_EVEIL)
+
+            if evenement == "toucher":
+                sourd = False
+                texte, fin_de_parole = self.ecouter_au_toucher()
+            # Un seul mot très court, c'est le plus souvent du bruit transcrit à tort.
+            if evenement == "rien" or not texte or (evenement != "toucher" and len(texte) <= 3):
+                continue
+
+            fin_de_parole = fin_de_parole or time.monotonic()
+            self.corps.passer_a("reflexion")
+            if NE_PLUS_ECOUTER.search(texte):
+                self.noter("commande", texte)
+                sourd = True
+                self.voix.dire(JE_N_ECOUTE_PLUS)
+                continue
+            if REPRENDRE_PERSONNALITE.search(texte):
+                self.noter("commande", texte)
+                self.voix.dire(JE_REPRENDS)
+                self.voix.attendre_fin()
+                return "personnalite"
+
+            self.repondre(texte, fin_de_parole)
+            dernier_echange = time.monotonic()
+            suite = not AU_REVOIR.search(texte)
 
 
 def main():
     analyse = argparse.ArgumentParser(description="Conversation en français avec Doly.")
     analyse.add_argument("--modele", default=MODELE_CLAUDE, help=f"modèle Claude (par défaut : {MODELE_CLAUDE})")
     analyse.add_argument("--attente", type=int, default=ATTENTE_MAX, help="secondes sans toucher avant de s'arrêter")
+    analyse.add_argument("--mains-libres", action="store_true", help="écoute aussi « Hé Doly », micro ouvert en permanence")
+    analyse.add_argument("--journal-discret", action="store_true", help="n'écrit pas tes phrases dans le journal")
+    analyse.add_argument("--attendre-origine", action="store_true", help="laisse d'abord démarrer le logiciel d'origine")
     options = analyse.parse_args()
+
+    # Par défaut, le système pose ses deux questions DNS (IPv4 et IPv6) en même temps. Sur ce réseau, l'une reste
+    # parfois sans réponse : 5 s de silence avant que Doly réponde. On les pose l'une après l'autre, et on réessaie
+    # au bout d'une seconde si une réponse se perd quand même. Ce réglage ne vaut que pour cette appli.
+    os.environ.setdefault("RES_OPTIONS", "single-request timeout:1")
 
     if not charger_cle():
         print("[erreur] Clé API introuvable. Lance d'abord : bash enregistrer_cle.sh")
@@ -422,7 +675,14 @@ def main():
 
     # Une coupure de la connexion SSH ne doit pas laisser le robot sans sa personnalité.
     for signal_recu in (signal.SIGHUP, signal.SIGTERM):
-        signal.signal(signal_recu, lambda *_: sys.exit(1))
+        signal.signal(signal_recu, lambda *_: sys.exit(0))
+
+    if options.attendre_origine:
+        # Au démarrage, le logiciel d'origine se lance et installe ses mises à jour : on ne le gêne pas.
+        fin = time.monotonic() + ATTENTE_ORIGINE
+        while not service_doly_actif() and time.monotonic() < fin:
+            time.sleep(2)
+        print(f"[info] Logiciel d'origine actif : {service_doly_actif()}", flush=True)
 
     SetLogLevel(-1)
     relancer_service = service_doly_actif()
@@ -432,6 +692,7 @@ def main():
 
     voix = None
     corps = None
+    fin = None
     try:
         rc = touch.init()
         if rc < 0:
@@ -445,14 +706,20 @@ def main():
         oreille.rechauffer(essai)
         os.remove(essai)
         print("[info] Prêt.", flush=True)
-        converser(voix, oreille, Cerveau(options.modele, corps), corps, options.attente)
+        conversation = Conversation(voix, oreille, Cerveau(options.modele, corps), corps, options.journal_discret)
+        if options.mains_libres:
+            fin = conversation.mains_libres()
+        else:
+            conversation.au_toucher(options.attente)
     finally:
         if voix:
             voix.fermer()
         if corps:
             corps.fermer()
         touch.dispose()
-        if relancer_service:
+        if fin == "eteindre":
+            subprocess.run(["sudo", "-n", "systemctl", "poweroff"])
+        elif relancer_service or fin == "personnalite":
             subprocess.run(["sudo", "-n", "systemctl", "start", "doly"])
     return 0
 

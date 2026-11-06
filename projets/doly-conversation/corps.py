@@ -63,7 +63,7 @@ VITESSE_ROUES = 30  # en pourcentage
 DELAI_DEPLACEMENT = 8  # secondes au maximum pour un déplacement
 OBSTACLE_AU_DEPART = 150  # mm : il refuse d'avancer si un obstacle est plus proche
 OBSTACLE_EN_ROUTE = 60  # mm : il s'arrête si un obstacle est plus proche
-BATTERIE_MIN = 10  # pour cent : en dessous, il refuse de se déplacer
+BATTERIE_MIN = 20  # pour cent : en dessous, il refuse de se déplacer, car l'effort pourrait le couper net
 MAX_DEPLACEMENTS_PAR_PHRASE = 5
 
 # Testé au sol : un angle négatif le fait tourner vers sa gauche.
@@ -191,6 +191,9 @@ class Corps:
                 if numero_geste != self.numero_geste:
                     return
                 time.sleep(0.05)
+
+    def batterie(self):
+        return batterie.get_capacity()
 
     def sol_sous_lui(self):
         """Vrai si les 4 capteurs de vide voient le sol. Testé : High au sol, Low quand on le soulève."""

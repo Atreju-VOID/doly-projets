@@ -1,0 +1,21 @@
+[Unit]
+Description=Doly converse en français (mode mains libres)
+# Pas de lien d'ordre avec doly_update : il démarre lui-même après multi-user.target, ce qui créerait une boucle.
+# L'appli attend elle-même que le logiciel d'origine soit prêt (--attendre-origine).
+# Après 3 échecs en 5 minutes, on laisse la main au logiciel d'origine.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=doly
+WorkingDirectory=/home/doly/doly-projets/projets/doly-conversation
+# Dossier en mémoire pour les phrases à prononcer (/run/doly-francais), supprimé à l'arrêt du service.
+RuntimeDirectory=doly-francais
+ExecStart=/home/doly/doly-env/bin/python converser.py --mains-libres --journal-discret --attendre-origine
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
