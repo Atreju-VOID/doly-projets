@@ -28,6 +28,13 @@ L'utilisateur parle français : réponds, commente le code et écris la document
   - divers : `doly_helper` (réglages, arrêt du service Doly), `doly_fan` (ventilateur), `doly_io` (6 GPIO), `doly_color` (`Color`, `ColorCode`), `doly_vcontent` (`VContent`, images).
 - Micros : à utiliser via ALSA (ils ne sont pas dans le SDK). Pas d'annulation d'écho matérielle : il faut une solution logicielle, ou couper le micro quand Doly parle. Testé avec `arecord -D plughw:0,0`, service arrêté : les deux canaux sont strictement identiques, donc enregistre en mono, et retire le décalage continu avant d'analyser le son.
 - Son hors SDK : pas de serveur audio, et le service Doly monopolise la carte son tant qu'il tourne. Pour `aplay`, utilise `plughw:0,0` : `default` refuse l'utilisateur `doly`, car le verrou de son mixage appartient à `root`.
+- Vérifié sur le robot en v1.014 :
+  - `doly_edge` : `High` au sol et `Low` en l'air, valable dès l'initialisation. Une surface sombre peut sembler être du vide.
+  - `doly_tof` : voit de 2 à 20 cm environ, et renvoie -1 ou une erreur quand rien n'est à portée.
+  - `doly_battery` : `get_capacity()` renvoie 0 pendant environ 0,3 s après `init()`.
+  - `doly_arm` : le premier angle lu peut être faux (251° au repos). Les suivants sont justes.
+  - `doly_drive` : un angle négatif le fait tourner vers sa gauche. `abort()` met les roues en état d'erreur.
+- Une fois le service Doly arrêté, rien ne pilote le ventilateur : appelle `fan.init(True)` dans toute appli qui tourne longtemps.
 - Extensions : 6 GPIO, Qwiic/I2C sur `/dev/i2c-6` (les autres bus I2C sont internes), UART, USB, 2 sorties servo. Alimentation 5 V utilisateur : 1,5 A en continu.
 
 ## Règles pour le code qui tourne sur Doly
@@ -38,6 +45,7 @@ L'utilisateur parle français : réponds, commente le code et écris la document
 - Les clés API et autres secrets vont dans un fichier `.env` (ignoré par git), jamais dans le code. Sur le robot, la clé Claude est dans `~/.config/doly/.env`, écrite par `projets/doly-conversation/enregistrer_cle.sh`. Ne demande jamais de clé dans la conversation.
 - Depuis une session cloud, Claude n'a pas accès au robot : c'est l'utilisateur qui teste sur Doly. Dis-lui exactement quoi lancer et ce qu'il doit voir ou entendre. Pour les déplacements, conseille de tester au sol plutôt que sur une table.
 - Depuis le PC de l'utilisateur, Claude peut se connecter au robot avec la clé SSH dédiée : `ssh -i ~/.ssh/doly_ed25519 doly@doly`, ou l'adresse IP du robot si le nom ne répond pas. Préviens l'utilisateur avant de faire parler ou bouger le robot.
+- Tout nouveau mouvement passe d'abord par un test guidé, avec l'utilisateur à côté, comme dans `projets/doly-conversation/`. Le code qui fait rouler le robot passe par `Corps.rouler`, qui surveille le vide, les obstacles, les touchers et la durée.
 - Le service Doly repart tout seul au démarrage, et le robot installe aussi ses mises à jour à ce moment-là. Évite `apt upgrade` sur le robot : installe les paquets Python dans un environnement virtuel.
 
 ## Organisation du dépôt

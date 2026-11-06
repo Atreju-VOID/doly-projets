@@ -26,7 +26,7 @@ Chaque projet est dans `projets/<nom>/`, avec un README qui explique comment le 
 
 - [Doly parle français](projets/doly-parle/) : fait dire à Doly la phrase de ton choix, sans Internet.
 - [Doly écoute en français](projets/doly-ecoute/) : tu touches Doly, tu parles, il répète ce qu'il a compris, sans Internet.
-- [Doly converse en français](projets/doly-conversation/) : conversation à voix haute avec Doly, grâce à Claude.
+- [Doly converse en français](projets/doly-conversation/) : conversation à voix haute avec Doly grâce à Claude, avec ses yeux, ses gestes et de petits déplacements.
 
 ## Sources officielles
 

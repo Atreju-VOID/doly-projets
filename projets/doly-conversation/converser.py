@@ -5,7 +5,7 @@ converser.py
 Conversation en français avec Doly : tu touches, tu parles, Claude réfléchit, Doly répond.
 
 Pose un doigt sur un capteur au-dessus de ses yeux, parle après le bip, puis lève le doigt.
-Toucher Doly pendant qu'il parle lui coupe la parole. Dire « au revoir » termine la conversation.
+Toucher Doly pendant qu'il parle ou bouge l'arrête. Dire « au revoir » termine la conversation.
 
 Usage, sur le robot :
     ~/doly-env/bin/python converser.py
@@ -39,12 +39,15 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "doly-parle"))
 from dire import CARTE_SON, DOSSIER_PIPER, VOIX, creer_bip, service_doly_actif
 
+from corps import OUTILS, Corps
+
 FICHIER_CLE = os.path.expanduser("~/.config/doly/.env")
 MODELE_VOSK = os.path.expanduser("~/doly-modeles/vosk-model-small-fr-0.22")
 MODELE_CLAUDE = "claude-haiku-5-5"
 EFFORT = "low"  # réponses courtes à l'oral : peu de réflexion, donc plus rapide et moins cher
 MAX_TOKENS = 1024
 MAX_ECHANGES = 20  # au-delà, Doly repart d'une conversation neuve, pour limiter le coût
+MAX_TOURS_OUTILS = 8  # appels à Claude au maximum pour une même phrase
 
 TAUX = 16000
 TAILLE_BLOC = TAUX * 2 // 10  # 0,1 s de son
@@ -64,9 +67,18 @@ Ce que tu écris est lu à voix haute par une synthèse vocale, alors écris com
 Ce que tu reçois vient d'une reconnaissance vocale : il n'y a pas de ponctuation, et il peut y avoir des erreurs. \
 Devine le sens si c'est possible, sinon demande gentiment de répéter.
 
-Pour l'instant, tu peux seulement écouter et parler. Tu ne peux ni bouger, ni voir, ni aller sur Internet, et tu ne \
-connais ni l'heure ni la météo. Si on te le demande, dis-le simplement au lieu d'inventer. Nous sommes le \
-{time.strftime("%d/%m/%Y")}."""
+Tu as un corps : tes yeux, tes bras et tes chenilles, grâce à trois outils.
+- Utilise se_deplacer uniquement quand on te demande clairement de bouger, jamais de ta propre initiative. Tu ne \
+fais que de petits déplacements, cinq au maximum par demande. S'il répond qu'il a refusé ou s'est arrêté, explique \
+simplement pourquoi.
+- Utilise bouger_les_bras quand on te le demande, ou pour saluer au début et à la fin d'une conversation.
+- Utilise exprimer seulement quand une émotion forte s'y prête, pas à chaque phrase.
+- Dis d'abord une phrase très courte, puis utilise l'outil. Après un outil, n'ajoute rien, sauf s'il a échoué ou \
+s'il reste une question à laquelle répondre.
+- Ne décris jamais tes gestes dans le texte.
+
+Pour l'instant, tu ne peux ni voir, ni aller sur Internet, et tu ne connais ni l'heure ni la météo. Si on te le \
+demande, dis-le simplement au lieu d'inventer. Nous sommes le {time.strftime("%d/%m/%Y")}."""
 
 ACCUEIL = "Je t'écoute ! Pose un doigt au-dessus de mes yeux pour me parler."
 TROP_COURT = "Garde le doigt posé pendant que tu parles."
@@ -78,6 +90,7 @@ ERREUR_CREDIT = "Je n'ai plus de crédit pour réfléchir."
 ERREUR_LIMITE = "Je reçois trop de demandes. Réessaie dans un instant."
 ERREUR_AUTRE = "Quelque chose ne va pas de mon côté. Réessaie dans un instant."
 REFUS = "Je préfère ne pas répondre à ça."
+TROP_D_ACTIONS = "Ça fait beaucoup d'un coup. Redemande-moi la suite."
 
 
 def charger_cle():
@@ -154,7 +167,10 @@ class Voix:
                 if chemin and generation == self.generation:
                     if self.premier_son is None:
                         self.premier_son = time.monotonic()
-                    lecteur = self.lecteur = subprocess.Popen(["aplay", "-D", CARTE_SON, "-q", chemin])
+                    # aplay écrit une erreur quand on lui coupe la parole : ce n'en est pas une.
+                    lecteur = self.lecteur = subprocess.Popen(
+                        ["aplay", "-D", CARTE_SON, "-q", chemin], stderr=subprocess.DEVNULL
+                    )
             if lecteur:
                 lecteur.wait()
                 self.lecteur = None
@@ -252,71 +268,98 @@ class Oreille:
 
 
 class Cerveau:
-    """Envoie la conversation à Claude et transmet chaque phrase dès qu'elle est complète."""
+    """Envoie la conversation à Claude, transmet chaque phrase dès qu'elle est complète et exécute ses outils."""
 
-    def __init__(self, modele):
+    def __init__(self, modele, corps):
         self.client = anthropic.Anthropic(timeout=anthropic.Timeout(30.0, connect=5.0), max_retries=1)
         self.modele = modele
+        self.corps = corps
         self.messages = []
         self.premier_mot = None
 
-    def repondre(self, texte, dire):
+    def repondre(self, texte, dire, actif):
+        """Répond à une phrase. actif() devient faux si la réponse a été interrompue par un toucher."""
         if len(self.messages) >= 2 * MAX_ECHANGES:
             self.messages = []
+        debut_du_tour = len(self.messages)
         self.messages.append({"role": "user", "content": texte})
         self.premier_mot = None
         depart = time.monotonic()
-        tampon = ""
         try:
-            with self.client.messages.stream(
-                model=self.modele,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEME,
-                messages=self.messages,
-                output_config={"effort": EFFORT},
-            ) as flux:
-                for morceau in flux.text_stream:
-                    if self.premier_mot is None:
-                        self.premier_mot = time.monotonic() - depart
-                    tampon += morceau
-                    phrases, tampon = extraire_phrases(tampon)
-                    for phrase in phrases:
-                        dire(phrase)
-                final = flux.get_final_message()
+            for _ in range(MAX_TOURS_OUTILS):
+                final = self._un_appel(dire, depart)
+                if final.stop_reason == "refusal":
+                    self._echec("réponse refusée par le modèle", REFUS, dire, debut_du_tour)
+                    return
+                # On renvoie le contenu complet à chaque tour : les blocs de réflexion doivent rester intacts.
+                # Après un outil, Claude peut n'avoir rien à ajouter : sa réponse est alors vide.
+                if final.content:
+                    self.messages.append({"role": "assistant", "content": final.content})
+                print(f"[claude] {final.usage.input_tokens} tokens envoyés, {final.usage.output_tokens} reçus, "
+                      f"{time.monotonic() - depart:.2f} s, blocs {[bloc.type for bloc in final.content]}", flush=True)
+                if final.stop_reason != "tool_use":
+                    return
+                self.messages.append({"role": "user", "content": self._executer_outils(final.content, actif)})
+            # Trop d'appels d'affilée : on répond aux outils sans redemander à Claude, pour garder un historique valide.
+            print("[info] Limite d'appels atteinte pour cette phrase", flush=True)
+            dire(TROP_D_ACTIONS)
         except anthropic.AuthenticationError:
-            self._echec("clé API refusée", ERREUR_CLE, dire)
-            return
+            self._echec("clé API refusée", ERREUR_CLE, dire, debut_du_tour)
         except anthropic.RateLimitError:
-            self._echec("trop de demandes", ERREUR_LIMITE, dire)
-            return
+            self._echec("trop de demandes", ERREUR_LIMITE, dire, debut_du_tour)
         except anthropic.APIStatusError as e:
             credit = e.status_code == 402 or "credit" in str(e.message).lower()
-            self._echec(f"erreur API {e.status_code}", ERREUR_CREDIT if credit else ERREUR_AUTRE, dire)
-            return
+            self._echec(f"erreur API {e.status_code}", ERREUR_CREDIT if credit else ERREUR_AUTRE, dire, debut_du_tour)
         except anthropic.APIConnectionError:
-            self._echec("pas de connexion", ERREUR_RESEAU, dire)
-            return
+            self._echec("pas de connexion", ERREUR_RESEAU, dire, debut_du_tour)
 
-        if final.stop_reason == "refusal":
-            self._echec("réponse refusée par le modèle", REFUS, dire)
-            return
+    def _un_appel(self, dire, depart):
+        tampon = ""
+        with self.client.messages.stream(
+            model=self.modele,
+            max_tokens=MAX_TOKENS,
+            system=SYSTEME,
+            tools=OUTILS,
+            messages=self.messages,
+            output_config={"effort": EFFORT},
+        ) as flux:
+            for morceau in flux.text_stream:
+                if self.premier_mot is None:
+                    self.premier_mot = time.monotonic() - depart
+                tampon += morceau
+                phrases, tampon = extraire_phrases(tampon)
+                for phrase in phrases:
+                    dire(phrase)
+            final = flux.get_final_message()
         dire(tampon.strip())
-        # On renvoie le contenu complet à chaque tour : les blocs de réflexion doivent rester intacts.
-        self.messages.append({"role": "assistant", "content": final.content})
-        print(f"[claude] {final.usage.input_tokens} tokens envoyés, {final.usage.output_tokens} reçus", flush=True)
+        return final
 
-    def _echec(self, raison, phrase, dire):
+    def _executer_outils(self, contenu, actif):
+        resultats = []
+        for bloc in contenu:
+            if bloc.type != "tool_use":
+                continue
+            if actif():
+                message, erreur = self.corps.executer(bloc.name, bloc.input)
+            else:
+                message, erreur = "interrompu par un toucher", False
+            print(f"[outil] {bloc.name} {bloc.input} : {message}", flush=True)
+            resultats.append({"type": "tool_result", "tool_use_id": bloc.id, "content": message, "is_error": erreur})
+        return resultats
+
+    def _echec(self, raison, phrase, dire, debut_du_tour):
         print(f"[erreur] {raison}", flush=True)
-        self.messages.pop()
+        del self.messages[debut_du_tour:]
         dire(phrase)
 
 
-def converser(voix, oreille, cerveau, attente):
+def converser(voix, oreille, cerveau, corps, attente):
     voix.dire(ACCUEIL)
     reflexion = None
     while True:
         debut = time.monotonic()
         while not capteur_touche():
+            corps.passer_a("parole" if voix.parle() else "repos")
             if time.monotonic() - debut > attente and not voix.parle():
                 voix.dire(INACTIVITE)
                 voix.attendre_fin()
@@ -324,9 +367,12 @@ def converser(voix, oreille, cerveau, attente):
             time.sleep(0.05)
 
         voix.interrompre()
+        corps.arreter()
+        corps.passer_a("ecoute")
         voix.jouer_bip()
         texte, duree, doigt_leve = oreille.ecouter_tant_que_touche()
         transcrit = time.monotonic()
+        corps.passer_a("reflexion")
         if duree < DUREE_MIN:
             voix.dire(TROP_COURT)
             continue
@@ -342,11 +388,15 @@ def converser(voix, oreille, cerveau, attente):
         generation = voix.generation
         voix.premier_son = None
         reflexion = threading.Thread(
-            target=cerveau.repondre, args=(texte, lambda phrase: voix.dire(nettoyer(phrase), generation)), daemon=True
+            target=cerveau.repondre,
+            args=(texte, lambda phrase: voix.dire(nettoyer(phrase), generation), lambda: voix.generation == generation),
+            daemon=True,
         )
         reflexion.start()
 
         while (reflexion.is_alive() or voix.parle()) and not capteur_touche():
+            if voix.premier_son:
+                corps.passer_a("parole")
             time.sleep(0.05)
 
         if voix.premier_son:
@@ -381,22 +431,26 @@ def main():
         return 1
 
     voix = None
+    corps = None
     try:
         rc = touch.init()
         if rc < 0:
             print(f"[erreur] Capteurs tactiles indisponibles (code {rc}).")
             return 1
         print(f"[info] Préparation, modèle {options.modele} ...", flush=True)
+        corps = Corps()
         voix = Voix()
         oreille = Oreille()
         essai = voix.calculer("Bonjour, je me prépare à t'écouter.")
         oreille.rechauffer(essai)
         os.remove(essai)
         print("[info] Prêt.", flush=True)
-        converser(voix, oreille, Cerveau(options.modele), options.attente)
+        converser(voix, oreille, Cerveau(options.modele, corps), corps, options.attente)
     finally:
         if voix:
             voix.fermer()
+        if corps:
+            corps.fermer()
         touch.dispose()
         if relancer_service:
             subprocess.run(["sudo", "-n", "systemctl", "start", "doly"])
