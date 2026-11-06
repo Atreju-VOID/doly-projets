@@ -1,14 +1,79 @@
 # Doly converse en français
 
-Conversation à voix haute avec Doly : tu le touches ou tu dis « Hé Doly », tu parles, Claude réfléchit, Doly répond. Ses yeux et ses LED suivent la conversation, et il peut faire des gestes et se déplacer quand on le lui demande.
+Conversation à voix haute avec Doly : tu le touches ou tu dis « Hé Doly », tu parles, Claude réfléchit, Doly répond. Ses yeux et ses LED suivent la conversation, et il peut faire des gestes et se déplacer quand on le lui demande. Il reprend aussi en français ce que sait faire sa personnalité d'origine : météo, photos, minuteur, jeux, humeurs et réactions.
 
 La voix française ([doly-parle](../doly-parle/)) et la reconnaissance vocale ([doly-ecoute](../doly-ecoute/)) tournent sur le robot. Seul le texte compris part sur Internet, vers Claude.
 
+## Ce qu'il sait faire
+
+Tout a été essayé en vrai, partie par partie, à côté du robot : voir [GUIDE_DE_TEST.md](GUIDE_DE_TEST.md).
+
+| Tu lui dis | Ce qu'il fait |
+|---|---|
+| « Quel temps fait-il ? », « Et demain à Lyon ? » | Il donne la vraie météo et la montre sur ses yeux. |
+| « Quelle heure est-il ? », « Montre-moi la date. » | Il répond, et l'affiche si tu le demandes. |
+| « Mets un minuteur de 5 minutes. » | Il sonne à la fin. Un toucher arrête la sonnerie. |
+| « Prends une photo. » | La photo reste sur le robot, dans `/.doly/photos`. |
+| « On joue à la roue », « au défi éclair », « à Doly dort ». | Une partie de une à deux minutes, voir plus bas. |
+| « Tope là ! », « Fais un check. » | Il lève le bras et attend que tu tapes dedans. |
+| « Sois méchant », « Sois joyeux », « Sois combatif », « Sois gentil avec moi ». | Il change d'humeur pour un quart d'heure. |
+| « Danse ! », « Fais du sport. » | Il bouge en musique, et roule un peu, au sol uniquement. |
+| « Imagine que tu es à la plage. », « C'est mon anniversaire ! » | Il montre une scène sur ses yeux. |
+| « Fais le chat. » | Il imite un animal, parmi 30. |
+| « Mets tes yeux en vert. », « Prends des yeux numériques. » | Il s'en souvient d'une fois sur l'autre. |
+| « Va dormir. » | Il ferme les yeux jusqu'à ce que tu lui parles ou le touches. |
+
+Il connaît aussi son niveau de batterie, et il répond aux questions sur lui ou sur son humeur.
+
+### Ses humeurs et ses réactions
+
+Doly peut être **joyeux, méchant, combatif ou empathique**, avec trois niveaux. Il est méchant et combatif pour rire : grognon ou fanfaron, sans insulte ni menace. Si quelqu'un va vraiment mal, il redevient doux, quelle que soit son humeur.
+
+Son humeur dépend de la façon dont on le traite, puis revient à la normale. Les compliments et les caresses le rendent joyeux, les insultes et les coups méchant, les défis combatif, et une personne triste empathique. Avec le temps, son caractère garde une trace : trop de méchancetés le rendent grognon par défaut.
+
+Il réagit aussi tout seul, quand il est au repos, avec **ses yeux, ses LED, ses bras et de petits sons, mais jamais avec ses roues ni sa voix** :
+
+| Tu fais | Il réagit |
+|---|---|
+| Une tape brève sur sa tête | C'est une caresse : plus il y en a, plus il est content. |
+| Des tapes très rapides | Il s'agace, de plus en plus. |
+| Un doigt gardé posé | Un bip, puis il écoute ce que tu dis. Si tu ne parles pas, il apprécie, puis il finit par s'agacer. |
+| Une poussette ou un choc | Une réaction selon la force et le côté. |
+| Une secousse | Il a le tournis. |
+| Le soulever, le reposer | Il s'inquiète, puis il est soulagé. |
+| Soulever un seul côté | Il s'inquiète, et regarde de ce côté. |
+| Une main qui s'approche, à moins de 13 cm | Il la regarde, à gauche ou à droite, sans bruit. Au milieu, il fait une expression selon son humeur. |
+
+Le capteur tactile a besoin d'un vrai contact : il voit un appui franc presque à chaque fois, mais rarement une tape très courte après un moment de repos.
+
+La nuit, aux heures réglées dans l'appli officielle (22 h à 8 h par défaut), il s'endort après 10 minutes sans activité, et il se réveille le matin ou si on s'occupe de lui. Le micro reste ouvert, et « Hé Doly » le réveille.
+
+Pour se passer de ces réactions : `converser.py --sans-reactions`.
+
+### Ses jeux
+
+Sa personnalité d'origine a trois jeux, dont les règles ne sont pas publiées. Ceux-ci ont leurs propres règles, et utilisent les images et les sons déjà présents sur le robot.
+
+- **La roue :** chaque œil est une roue de fruits. Touche sa tête pour lancer, 5 manches. Deux fruits pareils gagnent, et deux cerises font le gros lot.
+- **Le défi éclair :** appuie vite et franchement au-dessus de l'œil qui s'allume, ou des deux côtés si les deux s'allument. Tu as 3 secondes au début, puis moins à chaque niveau, jusqu'à 1 seconde. Une erreur ou une cible ratée coûte une vie, et tu en as 3. Doly retient ton record.
+- **Doly dort :** attends qu'il ronfle, car appuyer plus tôt fait perdre. Approche ensuite ta main, et appuie sur sa tête sans le réveiller. S'il ouvre un œil, il arrête de ronfler et il regarde : ne bouge plus, car il voit une main qui bouge de plus de 2 cm.
+
+### Ce qui n'est pas repris
+
+| Fonction d'origine | Pourquoi |
+|---|---|
+| Se promener seul, reculer quand une main approche | Tu as choisi qu'il ne roule pas sans qu'on le lui demande. |
+| Retourner seul sur sa base | Cette fonction n'est pas dans le SDK. |
+| Reconnaître les visages | Ce sont des données personnelles, et il n'est prévu que des photos. |
+| Télécommande et programmation par blocs de l'appli | Elles fonctionnent avec sa personnalité d'origine : dis « reprends ta personnalité ». |
+
 ## Sécurité
 
-**Pose Doly au sol, jamais sur une table,** avec un mètre de libre autour de lui, loin d'un escalier et sans câble autour. **Un toucher au-dessus de ses yeux arrête tout mouvement.**
+**Pose Doly au sol, jamais sur une table,** avec un mètre de libre autour de lui, loin d'un escalier et sans câble autour. **Un appui franc au-dessus de ses yeux arrête tout mouvement :** le capteur voit mal une tape très courte.
 
-Il ne se déplace que si on le lui demande clairement, et seulement avec les mouvements prévus dans `corps.py` : 10 ou 20 cm, un quart de tour ou un demi-tour, 5 au maximum par demande.
+Il ne se déplace que si on le lui demande clairement, et seulement avec les mouvements prévus dans `corps.py` : 10 ou 20 cm, un quart de tour ou un demi-tour, 5 au maximum par demande. Danser, s'amuser et faire du sport comptent pour un déplacement chacun, passent par les mêmes garde-fous, et se font sur place si l'un d'eux refuse. Ses réactions spontanées n'utilisent jamais les roues.
+
+Les bras sont limités à 150° et à 60 % de leur vitesse, même quand une animation d'origine demande davantage. Si un toucher laisse un bras en l'air, il le baisse doucement 4 secondes plus tard.
 
 | Garde-fou | Comportement | Vérifié sur le robot |
 |---|---|---|
@@ -51,7 +116,7 @@ Pour essayer un autre modèle :
 
 Après environ 5 secondes, Doly dit « Je t'écoute ! ».
 
-- **Lui parler :** pose un doigt sur la zone tactile au-dessus de ses yeux, parle après le bip, puis lève le doigt.
+- **Lui parler :** pose un doigt sur la zone tactile au-dessus de ses yeux, attends le bip, parle, puis lève le doigt.
 - **Ses LED :** vert quand il écoute, orange quand il réfléchit, bleu quand il parle, éteintes au repos.
 - **Ses gestes :** il salue, lève les bras et montre ses émotions avec ses yeux.
 - **L'interrompre :** touche-le pendant qu'il parle ou bouge.
@@ -68,10 +133,12 @@ Pour lui parler sans le toucher :
 - **L'appeler :** dis « Hé Doly, lève les bras », d'une traite ou avec une courte pause. Ses LED passent au vert dès qu'il a entendu son nom. Si tu t'arrêtes après « Hé Doly », il fait un bip et attend ta phrase.
 - **Continuer :** juste après sa réponse, il écoute encore 5 secondes sans que tu répètes « Hé Doly ».
 - **Le toucher :** cela marche toujours, pour lui parler ou pour l'interrompre.
-- **« Ne m'écoute plus » :** il coupe son micro jusqu'au prochain toucher.
+- **« Ne m'écoute plus » :** il coupe son micro jusqu'à ce que tu lui parles en gardant le doigt posé. Une simple caresse ne le rouvre pas.
 - **« Reprends ta personnalité » :** il rend la main à sa personnalité d'origine.
 
-**Ce qui part sur Internet :** l'écoute de « Hé Doly » se fait sur le robot, et rien ne sort tant qu'il ne l'a pas entendu. Ensuite, seul le texte de ta phrase part vers Claude, ainsi que ce que tu dis dans les 5 secondes qui suivent sa réponse. Ce qui a été dit avant « Hé Doly » n'est ni transcrit, ni envoyé. Si Doly se réveille par erreur, ce qui suit partira quand même : dis « ne m'écoute plus » si cela arrive trop souvent.
+**Ce qui part sur Internet :** l'écoute de « Hé Doly » se fait sur le robot, et rien ne sort tant qu'il ne l'a pas entendu. Ensuite, seul le texte de ta phrase part vers Claude, ainsi que ce que tu dis dans les 5 secondes qui suivent sa réponse, et la date, sa batterie et son humeur. Ce qui a été dit avant « Hé Doly » n'est ni transcrit, ni envoyé. Si Doly se réveille par erreur, ce qui suit partira quand même : dis « ne m'écoute plus » si cela arrive trop souvent.
+
+Ses réactions spontanées, ses jeux et ses photos ne sortent pas du robot. Claude ne voit jamais les photos. Pour la météo, seule une position arrondie à environ 10 km, ou le nom de la ville demandée, part vers [Open-Meteo](https://open-meteo.com), un service gratuit pour un usage personnel non commercial, et seulement quand tu demandes la météo (données sous licence CC BY 4.0). Sans ville précisée, il utilise la position enregistrée par l'appli officielle dans les réglages du robot, ou la ville que tu lui as demandé de retenir.
 
 ## Démarrage automatique
 
@@ -116,15 +183,20 @@ Ces trois scripts sont à lancer sur le robot, à côté de lui. Doly explique c
 | `tester_bras.py` | Les bras, lentement et jusqu'à 60° | Sur une surface stable |
 | `tester_capteurs.py` | Les capteurs de vide et d'obstacle, sans bouger les roues | Au sol |
 | `tester_deplacements.py` | Les petits déplacements, les refus et les arrêts | Au sol, un mètre de libre |
+| `tester_fonctions.py <partie>` | Les yeux, les sons, les réactions, la photo, les jeux et les scènes, voir [GUIDE_DE_TEST.md](GUIDE_DE_TEST.md) | Selon la partie |
+
+`essais_sans_materiel.py` vérifie la logique avec des imitations du matériel (`faux_materiel.py`) : rien ne bouge ni ne sonne, et rien ne part sur Internet.
 
 ## Bon à savoir
 
 - **Modèle :** `claude-haiku-5-5`, avec `effort` bloqué sur `low`. Les deux se règlent en haut de `converser.py`.
 - **Délai mesuré sur le robot :** le premier son arrive environ 2 s après le doigt levé pour une réponse simple, et 2,5 à 6 s quand il y a des gestes ou un premier appel à froid. En mains libres, ajoute environ 1 s, le temps qu'il comprenne que ta phrase est finie.
 - **Autonomie à l'écoute :** de 38 % à la coupure en 42 minutes lors d'une décharge, de 34 % à l'extinction en 27 minutes lors d'une autre. Elle n'a jamais été mesurée depuis une charge complète.
-- **Coût :** avec Haiku 5.5 (0,10 $ / 0,50 $ par million de tokens), un échange consomme environ 1 500 à 2 500 tokens envoyés, à cause des outils, et il peut y avoir plusieurs appels par phrase. Comptez environ 0,03 centime par échange. Au-delà de 20 échanges, Doly repart d'une conversation neuve.
+- **Coût :** avec Haiku 5.5 (0,10 $ / 0,50 $ par million de tokens), les outils et les consignes font environ 4 700 tokens, gardés en cache pendant 5 minutes. D'après les essais, compte environ 0,06 centime de dollar pour la première phrase, puis 0,01 à 0,03 centime par phrase, tant que vous vous parlez à moins de 5 minutes d'écart. Au-delà de 20 échanges, Doly repart d'une conversation neuve. Ses réactions, ses jeux et ses photos ne coûtent rien.
 - **Crédits épuisés :** Doly dit qu'il n'a plus de crédit, et rien de plus n'est facturé tant que la recharge automatique reste désactivée.
 - **Ventilateur :** la personnalité d'origine étant arrêtée, le script active le mode automatique, qui vise à garder le processeur sous 70 °C.
-- **Mémoire :** à l'écoute, environ 320 Mo restent disponibles sur 907 Mo, et autour de 200 Mo après une longue conversation. L'appli gagne environ 25 Mo pendant ses 10 premières minutes d'écoute, à cause de Vosk, puis reste stable : aucune hausse pendant les 16 minutes suivantes. Elle n'a pas encore été mesurée sur plusieurs heures.
+- **Mémoire :** à l'écoute, environ 320 Mo restent disponibles sur 907 Mo, et autour de 200 Mo après une longue conversation. L'appli gagne environ 25 Mo pendant ses 10 premières minutes d'écoute, à cause de Vosk, puis se stabilise. Avec les réactions et les nouveaux outils, sur un essai de 22 minutes sans vrai micro, elle est montée de 249 à 339 Mo, et au moins 317 Mo sont restés disponibles. Elle n'a pas encore été mesurée sur plusieurs heures.
+- **Processeur :** à l'écoute, avec les réactions, environ 24 % d'un cœur sur les quatre. La photo prend environ 3,5 s et pèse 2 Mo.
 - **Son :** rien n'est enregistré sur le disque pendant la conversation.
-- **Limites actuelles :** Doly ne voit pas, ne va pas sur Internet, et il le dit quand on le lui demande.
+- **Fichiers sur le robot :** son caractère (`humeur.json`), son style (`style.json`), la ville retenue (`ville.json`) et les records (`records.json`) sont dans `~/.config/doly/`, hors du dépôt. Les supprimer les remet à zéro.
+- **Limites actuelles :** Doly ne voit pas et ne va pas sur Internet, sauf pour la météo, et il le dit quand on le lui demande.
