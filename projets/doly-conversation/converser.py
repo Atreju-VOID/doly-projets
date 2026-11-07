@@ -47,11 +47,14 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "doly-parle"))
 from dire import CARTE_SON, DOSSIER_PIPER, VOIX, creer_bip, service_doly_actif
 
+import garde
+import sante
+from base import Base
 import toucher
 from capacites import OUTILS, Capacites, dire_duree
 from corps import Corps
 from humeur import Humeur
-from reactions import Reactions
+from reactions import DUREE_MAX_APPUI, Reactions
 from toucher import capteur_touche
 
 FICHIER_CLE = os.path.expanduser("~/.config/doly/.env")
@@ -73,7 +76,16 @@ BLOCS_DE_VOIX_MIN = 3  # blocs de 0,1 s au-dessus du volume de la voix, pour dir
 DUREE_MIN = 0.8  # en dessous, le doigt a sans doute été levé trop tôt
 SONNERIES = 3  # nombre de sonneries à la fin du minuteur, si personne ne le touche
 ATTENTE_MAX = 300  # secondes sans toucher avant de rendre la main à sa personnalité d'origine
-ATTENTE_ORIGINE = 300  # secondes au maximum pour laisser démarrer le logiciel d'origine
+ATTENTE_ORIGINE = 300  # secondes au maximum après l'allumage pour laisser démarrer le logiciel d'origine
+# Durées maximales des choses longues et normales, pour le chien de garde (voir garde.py).
+# 45 s pour se préparer, soit 5 fois le temps mesuré : assez court pour qu'un blocage ici échoue 3 fois en 5 minutes
+# (45 s + 30 s de WatchdogSec + 10 s de RestartSec + le lancement), et rende la main à sa personnalité d'origine.
+PREPARATION_MAX = 45
+ACTIVITE_MAX = 600  # réponse de Claude avec ses outils, animation ou scène
+JEU_MAX = 900
+SONNERIE_MAX = 300
+ARRET_ORIGINE_MAX = 120
+FERMETURE_MAX = 120
 
 # Mode mains libres. « Doly » seul se déclenche à tort, par exemple sur « joli » : on exige les deux mots.
 MOT_D_EVEIL = "hé dolly"
@@ -343,6 +355,7 @@ class Oreille:
                     print("[erreur] Le micro s'est fermé", flush=True)
                     time.sleep(1)
                     return "rien", ""
+                garde.vivant()  # du son est vraiment arrivé : un micro bloqué ou fermé ne passe jamais par ici
                 memoire.append(bloc)
                 self.duree_guettee += len(bloc) / (2 * TAUX)
                 if self.guetteur.AcceptWaveform(bloc):
@@ -375,6 +388,7 @@ class Oreille:
             bloc = arecord.stdout.read(TAILLE_BLOC)
             if not bloc:
                 break
+            garde.vivant()
             if self.reconnaisseur.AcceptWaveform(bloc):
                 morceaux.append(json.loads(self.reconnaisseur.Result())["text"])
             # Juste après une fin de phrase, Vosk répond sans le champ « partial ».
@@ -395,6 +409,7 @@ class Oreille:
                 bloc = arecord.stdout.read(TAILLE_BLOC)
                 if not bloc:
                     return "rien", ""
+                garde.vivant()
                 if self.reconnaisseur.AcceptWaveform(bloc):
                     texte = json.loads(self.reconnaisseur.Result())["text"]
                     if texte:
@@ -461,6 +476,8 @@ class Oreille:
         transcription.join()
         arecord.wait()
         morceaux.append(json.loads(self.reconnaisseur.FinalResult())["text"])
+        if octets:
+            garde.vivant()  # du son est arrivé pendant que le doigt était posé
         texte = " ".join(m for m in morceaux if m)
         if silence_max is not None and not texte and blocs_de_voix < BLOCS_DE_VOIX_MIN:
             texte = None
@@ -582,6 +599,7 @@ class Conversation:
         self.cerveau = cerveau
         self.corps = corps
         self.capacites = capacites
+        self.base = capacites.base
         self.reactions = None  # branchées ensuite, sauf avec --sans-reactions
         self.discret = discret  # en service, le journal est gardé sur le disque : tes phrases n'y vont pas
         self.reflexion = None
@@ -649,7 +667,8 @@ class Conversation:
         if texte is None:
             self.corps.passer_a("repos")
             if capteur_touche():
-                self.reactions.appui_long(capteur_touche)
+                with garde.activite("doigt gardé posé", DUREE_MAX_APPUI + 30):
+                    self.reactions.appui_long(capteur_touche)
             else:  # le doigt est resté un peu plus longtemps, mais personne n'a parlé : c'est une caresse
                 self.reactions.tape(gauche)
             return "", None
@@ -669,24 +688,25 @@ class Conversation:
         self.noter_interaction()
         self.corps.reveiller(silencieux=True)
 
-        # Une réponse interrompue peut encore arriver : on l'attend pour garder l'historique en ordre.
-        if self.reflexion:
-            self.reflexion.join()
-        generation = self.voix.generation
-        self.voix.premier_son = None
-        self.reflexion = threading.Thread(
-            target=self.cerveau.repondre,
-            args=(texte, lambda phrase: self.voix.dire(nettoyer(phrase), generation),
-                  lambda: self.voix.generation == generation),
-            daemon=True,
-        )
-        self.reflexion.start()
+        with garde.activite("réponse", ACTIVITE_MAX):
+            # Une réponse interrompue peut encore arriver : on l'attend pour garder l'historique en ordre.
+            if self.reflexion:
+                self.reflexion.join()
+            generation = self.voix.generation
+            self.voix.premier_son = None
+            self.reflexion = threading.Thread(
+                target=self.cerveau.repondre,
+                args=(texte, lambda phrase: self.voix.dire(nettoyer(phrase), generation),
+                      lambda: self.voix.generation == generation),
+                daemon=True,
+            )
+            self.reflexion.start()
 
-        # Un jeu ou une scène demandés par Claude tournent encore quand sa phrase est finie : le micro attend.
-        while (self.reflechit() or self.occupe()) and not capteur_touche():
-            if self.voix.premier_son:
-                self.corps.passer_a("parole")
-            time.sleep(0.05)
+            # Un jeu ou une scène demandés par Claude tournent encore quand sa phrase est finie : le micro attend.
+            while (self.reflechit() or self.occupe()) and not capteur_touche():
+                if self.voix.premier_son:
+                    self.corps.passer_a("parole")
+                time.sleep(0.05)
 
         if self.voix.premier_son:
             print(f"[mesure] fin de ta phrase puis premier son : {self.voix.premier_son - fin_de_parole:.2f} s "
@@ -695,7 +715,8 @@ class Conversation:
 
         if not capteur_touche() and self.capacites.jeu_demande:
             self.corps.passer_a("repos")
-            self.capacites.lancer_jeu_demande()
+            with garde.activite("jeu", JEU_MAX):
+                self.capacites.lancer_jeu_demande()
 
     def sonner(self):
         """Le minuteur est fini : Doly sonne, jusqu'à ce qu'on le touche ou que les sonneries soient passées."""
@@ -705,16 +726,18 @@ class Conversation:
         self.noter_interaction()
         self.corps.reveiller(silencieux=True)
         self.voix.dire(f"Ton minuteur de {dire_duree(duree)} est terminé !")
-        for _ in range(SONNERIES):
-            self.corps.animateur.jouer("alarm", roues=False)
-            while self.occupe() and not capteur_touche():
-                time.sleep(0.05)
-            if capteur_touche():
-                self.voix.interrompre()
-                self.corps.arreter()
-                while capteur_touche():  # ce toucher sert à arrêter la sonnerie, pas à parler
+        with garde.activite("sonnerie", SONNERIE_MAX):
+            for _ in range(SONNERIES):
+                self.corps.animateur.jouer("alarm", roues=False)
+                while self.occupe() and not capteur_touche():
                     time.sleep(0.05)
-                return
+                if capteur_touche():
+                    self.voix.interrompre()
+                    self.corps.arreter()
+                    while capteur_touche():  # ce toucher sert à arrêter la sonnerie, pas à parler
+                        garde.vivant()
+                        time.sleep(0.05)
+                    return
 
     def au_toucher(self, attente):
         self.voix.dire(ACCUEIL)
@@ -748,15 +771,20 @@ class Conversation:
         # Le logiciel d'origine ne doit pas revenir se disputer le matériel avec nous.
         if service_doly_actif():
             print("[info] Le service d'origine est revenu : je l'arrête", flush=True)
-            helper.stop_doly_service()
+            with garde.activite("arrêt du service d'origine", ARRET_ORIGINE_MAX):
+                helper.stop_doly_service()
         capacite = self.corps.batterie()
-        print(f"[batterie] {capacite} %", flush=True)
-        if capacite <= BATTERIE_ALERTE and not self.alerte_donnee:
+        print(f"[batterie] {capacite} %, {self.base.pour_le_journal()}", flush=True)
+        # S'il n'est pas sûr d'être sur sa base, il prévient quand même : une alerte de trop vaut mieux qu'une coupure.
+        sur_base = self.base.sur_base()
+        if sur_base or capacite > BATTERIE_ALERTE + 5:
+            self.alerte_donnee = False  # si on le retire de sa base, il préviendra de nouveau
+        elif capacite <= BATTERIE_ALERTE and not self.alerte_donnee:
             self.voix.dire(BATTERIE_FAIBLE)
             self.alerte_donnee = True
-        elif capacite > BATTERIE_ALERTE + 5:
-            self.alerte_donnee = False
-        self.lectures_critiques = self.lectures_critiques + 1 if capacite < BATTERIE_EXTINCTION else 0
+        # Il ne reste allumé sous le seuil que si la batterie charge vraiment, pas s'il est simplement posé sur sa base.
+        critique = capacite < BATTERIE_EXTINCTION and not self.base.en_charge()
+        self.lectures_critiques = self.lectures_critiques + 1 if critique else 0
         return self.lectures_critiques >= LECTURES_AVANT_EXTINCTION
 
     def au_nom_entendu(self):
@@ -772,10 +800,12 @@ class Conversation:
         dernier_echange = time.monotonic()
         while True:
             # Il n'écoute pas pendant qu'il parle ou qu'il joue un son : il s'entendrait lui-même.
-            while self.occupe() and not capteur_touche():
-                if self.voix.parle() and not (self.reactions and self.reactions.joue()):
-                    self.corps.passer_a("parole")
-                time.sleep(0.05)
+            if self.occupe() and not capteur_touche():
+                with garde.activite("parole ou animation", ACTIVITE_MAX):
+                    while self.occupe() and not capteur_touche():
+                        if self.voix.parle() and not (self.reactions and self.reactions.joue()):
+                            self.corps.passer_a("parole")
+                        time.sleep(0.05)
 
             if self.surveiller():
                 self.voix.dire(JE_M_ETEINS)
@@ -792,6 +822,7 @@ class Conversation:
             if capteur_touche():
                 evenement, texte = "toucher", ""
             elif sourd:
+                garde.vivant()  # micro fermé exprès : c'est le seul cas où cette boucle tourne sans recevoir de son
                 self.corps.passer_a("repos")
                 time.sleep(0.05)
                 continue
@@ -836,6 +867,35 @@ class Conversation:
             suite = not AU_REVOIR.search(texte) and not self.corps.dort
 
 
+def nombre_de_relances():
+    """Combien de fois systemd a relancé l'appli toute seule, ou 0 si on ne le sait pas."""
+    unite = os.environ.get("DOLY_UNITE")  # fixé par le fichier du service
+    if not unite:
+        return 0
+    try:
+        sortie = subprocess.run(["systemctl", "show", unite, "-p", "NRestarts", "--value"],
+                                capture_output=True, text=True, timeout=10)
+        return int(sortie.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def secondes_depuis_l_allumage():
+    with open("/proc/uptime") as f:
+        return float(f.read().split()[0])
+
+
+def attente_de_l_origine(origine_active, relances, depuis_l_allumage):
+    """Combien de secondes laisser au logiciel d'origine pour démarrer.
+
+    Il ne démarre qu'une fois, juste après l'allumage. Après une relance automatique, ou longtemps après l'allumage, il ne
+    viendra pas : attendre laisserait Doly sourd pour rien, et assez longtemps pour que 3 échecs ne tiennent jamais en
+    5 minutes, si bien qu'il ne rendrait jamais la main à sa personnalité d'origine."""
+    if origine_active or relances > 0:
+        return 0
+    return max(0, ATTENTE_ORIGINE - depuis_l_allumage)
+
+
 def main():
     analyse = argparse.ArgumentParser(description="Conversation en français avec Doly.")
     analyse.add_argument("--modele", default=MODELE_CLAUDE, help=f"modèle Claude (par défaut : {MODELE_CLAUDE})")
@@ -845,6 +905,11 @@ def main():
     analyse.add_argument("--attendre-origine", action="store_true", help="laisse d'abord démarrer le logiciel d'origine")
     analyse.add_argument("--sans-reactions", action="store_true", help="pas de réactions spontanées aux touchers et aux chocs")
     options = analyse.parse_args()
+
+    garde.demarrer()  # le plus tôt possible : voir la raison dans garde.py
+    relances = nombre_de_relances()
+    if relances:
+        print(f"[garde] Relance automatique n° {relances}", flush=True)
 
     # Par défaut, le système pose ses deux questions DNS (IPv4 et IPv6) en même temps. Sur ce réseau, l'une reste
     # parfois sans réponse : 5 s de silence avant que Doly réponde. On les pose l'une après l'autre, et on réessaie
@@ -861,16 +926,19 @@ def main():
 
     if options.attendre_origine:
         # Au démarrage, le logiciel d'origine se lance et installe ses mises à jour : on ne le gêne pas.
-        fin = time.monotonic() + ATTENTE_ORIGINE
-        while not service_doly_actif() and time.monotonic() < fin:
-            time.sleep(2)
+        attente = attente_de_l_origine(service_doly_actif(), relances, secondes_depuis_l_allumage())
+        fin = time.monotonic() + attente
+        with garde.activite("attente du logiciel d'origine", attente + 30):
+            while not service_doly_actif() and time.monotonic() < fin:
+                time.sleep(2)
         print(f"[info] Logiciel d'origine actif : {service_doly_actif()}", flush=True)
 
     SetLogLevel(-1)
     relancer_service = service_doly_actif()
-    if helper.stop_doly_service() < 0:
-        print("[erreur] Impossible d'arrêter le service Doly.")
-        return 1
+    with garde.activite("arrêt du service d'origine", PREPARATION_MAX):
+        if helper.stop_doly_service() < 0:
+            print("[erreur] Impossible d'arrêter le service Doly.")
+            return 1
 
     voix = None
     corps = None
@@ -878,48 +946,53 @@ def main():
     reactions = None
     fin = None
     try:
-        rc = touch.init()
-        if rc < 0:
-            print(f"[erreur] Capteurs tactiles indisponibles (code {rc}).")
-            return 1
-        toucher.demarrer()
-        print(f"[info] Préparation, modèle {options.modele} ...", flush=True)
-        corps = Corps()
-        voix = Voix()
-        corps.animateur.jouer_son = voix.jouer_son
-        oreille = Oreille()
-        essai = voix.calculer("Bonjour, je me prépare à t'écouter.")
-        oreille.rechauffer(essai)
-        os.remove(essai)
-        humeur = Humeur()
-        capacites = Capacites(corps, voix, humeur)
-        cerveau = Cerveau(options.modele, capacites, options.journal_discret)
-        conversation = Conversation(voix, oreille, cerveau, corps, capacites, options.journal_discret)
-        if not options.sans_reactions:
-            reactions = Reactions(corps, humeur, conversation.au_repos, dernier_toucher=toucher.dernier_evenement)
-            capacites.reactions = reactions
-            conversation.reactions = reactions
-            reactions.demarrer()
+        with garde.activite("préparation", PREPARATION_MAX):
+            rc = touch.init()
+            if rc < 0:
+                print(f"[erreur] Capteurs tactiles indisponibles (code {rc}).")
+                return 1
+            toucher.demarrer()
+            print(f"[info] Préparation, modèle {options.modele} ...", flush=True)
+            corps = Corps()
+            voix = Voix()
+            corps.animateur.jouer_son = voix.jouer_son
+            oreille = Oreille()
+            essai = voix.calculer("Bonjour, je me prépare à t'écouter.")
+            oreille.rechauffer(essai)
+            os.remove(essai)
+            humeur = Humeur()
+            base = Base()
+            base.demarrer()
+            capacites = Capacites(corps, voix, humeur, base=base)
+            cerveau = Cerveau(options.modele, capacites, options.journal_discret)
+            conversation = Conversation(voix, oreille, cerveau, corps, capacites, options.journal_discret)
+            if not options.sans_reactions:
+                reactions = Reactions(corps, humeur, conversation.au_repos, dernier_toucher=toucher.dernier_evenement)
+                capacites.reactions = reactions
+                conversation.reactions = reactions
+                reactions.demarrer()
         print("[info] Prêt.", flush=True)
+        sante.demarrer(voix.piper.pid)
         if options.mains_libres:
             fin = conversation.mains_libres()
         else:
             conversation.au_toucher(options.attente)
     finally:
-        if reactions:
-            reactions.arreter()
-        if humeur:
-            humeur.enregistrer()
-        if voix:
-            voix.fermer()
-        if corps:
-            corps.fermer()
-        toucher.arreter()
-        touch.dispose()
-        if fin == "eteindre":
-            subprocess.run(["sudo", "-n", "systemctl", "poweroff"])
-        elif relancer_service or fin == "personnalite":
-            subprocess.run(["sudo", "-n", "systemctl", "start", "doly"])
+        with garde.activite("fermeture", FERMETURE_MAX):
+            if reactions:
+                reactions.arreter()
+            if humeur:
+                humeur.enregistrer()
+            if voix:
+                voix.fermer()
+            if corps:
+                corps.fermer()
+            toucher.arreter()
+            touch.dispose()
+            if fin == "eteindre":
+                subprocess.run(["sudo", "-n", "systemctl", "poweroff"])
+            elif relancer_service or fin == "personnalite":
+                subprocess.run(["sudo", "-n", "systemctl", "start", "doly"])
     return 0
 
 

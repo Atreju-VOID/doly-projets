@@ -63,6 +63,39 @@ La reconnaissance vocale se trompe parfois, surtout sur les mots qui se prononce
 
 Ctrl+C l'arrête.
 
+## La solidité
+
+Ces tests relancent l'appli, et **Doly redit « Je t'écoute ! » à chaque fois**. Au bout de 3 gels, sa personnalité d'origine reprend : elle peut rouler, alors laisse-le au sol, sur sa base ou dans tes mains.
+
+**Une appli figée.** Avec l'appli installée, qui tourne :
+
+```bash
+sudo kill -STOP $(systemctl show doly-francais -p MainPID --value)
+```
+
+Environ 30 s plus tard, le journal indique `Watchdog timeout`, puis `[garde] Moteurs arrêtés`, et Doly redit « Je t'écoute ! » 15 à 20 s après. Pour vérifier le matériel : dis « Hé Doly, lève les bras », passe ta main devant un œil, et tape sa tête.
+
+**Un micro figé :**
+
+```bash
+sudo kill -STOP $(pgrep -x arecord | head -1)
+```
+
+Environ 20 s plus tard, `[garde] Plus de signe de vie`, puis la même relance. Il ne doit y avoir aucun gel pendant un jeu, une longue réponse ou un doigt gardé posé.
+
+**Le repli :** fais 3 gels d'affilée de l'appli, en attendant chaque fois qu'elle soit prête. Sa personnalité d'origine doit reprendre seule. Pour revenir ensuite à l'appli :
+
+```bash
+sudo systemctl reset-failed doly-francais
+sudo systemctl start doly-francais
+```
+
+**Sa place :** `python3 mesurer_base.py --duree 120`, en le retirant de sa base puis en l'y remettant : voir les valeurs attendues dans le [README](README.md). Attends 20 s, puis demande « Hé Doly, est-ce que tu es sur ta base ? ». Compare aussi avec la ligne `[batterie]` du journal, qui donne sa place chaque minute.
+
+**L'alerte de batterie :** retire-le de sa base et laisse-le à l'écoute, ce qui prend plusieurs heures depuis une batterie pleine. À 30 %, il doit dire « Ma batterie est faible ». Pose-le alors sur sa base : la LED rouge s'allume dessous, le journal indique `sur sa base` et un courant positif, et l'alerte ne se répète pas.
+
+**Le bilan :** `python3 resumer_journal.py`. « Sur la dernière heure » n'apparaît qu'après une heure et demie d'écoute. Le chiffre reste normal s'il a monté pendant une conversation : c'est un chiffre qui monte encore au repos qui serait inquiétant.
+
 ## Après le test
 
 Pour relancer l'appli installée :
@@ -71,4 +104,4 @@ Pour relancer l'appli installée :
 sudo systemctl start doly-francais
 ```
 
-Elle attend 5 minutes avant de dire « Je t'écoute ! », car sa personnalité d'origine est arrêtée.
+Elle dit « Je t'écoute ! » une quinzaine de secondes plus tard. Elle n'attend sa personnalité d'origine que dans les 5 minutes qui suivent l'allumage.

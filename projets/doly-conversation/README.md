@@ -23,7 +23,7 @@ Tout a été essayé en vrai, partie par partie, à côté du robot : voir [GUID
 | « Mets tes yeux en vert. », « Prends des yeux numériques. » | Il s'en souvient d'une fois sur l'autre. |
 | « Va dormir. » | Il ferme les yeux jusqu'à ce que tu lui parles ou le touches. |
 
-Il connaît aussi son niveau de batterie, et il répond aux questions sur lui ou sur son humeur.
+Il connaît aussi son niveau de batterie, il sait s'il est sur sa base, et il répond aux questions sur lui ou sur son humeur.
 
 ### Ses humeurs et ses réactions
 
@@ -150,13 +150,15 @@ bash installer_demarrage.sh
 
 Après l'allumage, sa personnalité d'origine démarre et installe ses éventuelles mises à jour, puis l'appli prend la main. Il dit « Je t'écoute ! » environ 40 secondes après le redémarrage.
 
+**Après une mise à jour du code,** relance cette commande si `doly-francais.service` a changé : `git pull` ne suffit pas à l'installer.
+
 Pour tout désactiver et retrouver sa personnalité d'origine :
 
 ```bash
 sudo systemctl disable --now doly-francais
 ```
 
-Pour lancer un autre script sur le robot sans le désactiver, arrête d'abord l'appli. Elle repartira au prochain allumage :
+Pour lancer un autre script sur le robot sans le désactiver, arrête d'abord l'appli. Elle repartira au prochain allumage, ou avec `sudo systemctl start doly-francais`, sans attendre :
 
 ```bash
 sudo systemctl stop doly-francais
@@ -166,13 +168,92 @@ sudo systemctl stop doly-francais
 
 - **Micro :** il reste ouvert en permanence, sauf quand Doly parle ou après « ne m'écoute plus ». Le son reste en mémoire vive, 8 secondes au plus, et aucun fichier de son n'est écrit sur le disque. Tes phrases n'apparaissent pas dans le journal du robot.
 - **Sa personnalité d'origine :** elle ne tourne plus, sauf si tu la demandes ou si l'appli échoue 3 fois en 5 minutes. Elle reprend alors la main toute seule.
-- **Sa batterie :** il ne retourne pas seul sur sa base. À 30 %, il demande qu'on l'y pose, et il s'éteint une vingtaine de minutes plus tard. Sous 15 %, confirmé par 2 lectures à une minute d'écart, il s'éteint, et il faut ensuite le rallumer à la main. Le SDK n'indique pas s'il est en train de charger, et le niveau affiché semble plus haut sur la base : sa lecture est passée de 47 % à 34 % en une minute, sans doute à sa sortie de la base. Sous 15 %, il s'éteint aussi sur sa base, alors laisse-le charger avant de le rallumer. Ces seuils viennent de deux décharges mesurées. L'alerte et l'extinction ont été vérifiées une fois sur le robot : annonces entendues, et arrêt propre confirmé par le journal, à 12 %.
+- **Sa batterie :** il ne retourne pas seul sur sa base. À 30 %, il demande qu'on l'y pose, sauf s'il y est déjà, et il s'éteint une vingtaine de minutes plus tard. Sous 15 %, confirmé par 2 lectures à une minute d'écart, il s'éteint, sauf si la batterie charge vraiment, et il faut ensuite le rallumer à la main. Le niveau affiché est plus haut sur la base : sa lecture est passée de 47 % à 34 % en une minute à sa sortie de la base. S'il ne sait pas où il est, il garde le comportement le plus prudent : il prévient et il s'éteint. Ces seuils viennent de deux décharges mesurées. L'alerte et l'extinction ont été vérifiées une fois sur le robot, avant la détection de la base : annonces entendues, et arrêt propre confirmé par le journal, à 12 %.
 - **Ses mises à jour :** l'appli laisse d'abord démarrer sa personnalité d'origine pour ne pas les gêner, mais ce mode n'a pas encore été observé pendant une vraie mise à jour.
-- **Si Doly ne réagit plus du tout :** redémarre-le. Si le problème revient, regarde le journal avec la commande ci-dessous.
+- **Si Doly ne réagit plus du tout :** attends une minute, car il repart normalement tout seul (voir « S'il se fige »). Sinon, redémarre-le. Si le problème revient, regarde le journal avec la commande ci-dessous.
 
 ```bash
 sudo journalctl -u doly-francais -b --no-pager | tail -30
 ```
+
+## S'il se fige
+
+Un programme figé reste « actif » pour le système : un micro bloqué laissait donc Doly sourd pour toujours. Maintenant, l'appli doit prouver à systemd qu'elle vit (`WatchdogSec`, voir `garde.py`). Cette preuve ne part que si sa boucle principale avance vraiment, donc si du son arrive du micro, ou si elle fait une chose longue et normale dans un délai fixé :
+
+| Activité normale | Durée permise |
+|---|---|
+| Réponse de Claude, parole, animation ou scène | 10 minutes |
+| Jeu | 15 minutes |
+| Sonnerie du minuteur | 5 minutes |
+| Doigt gardé posé | 2 minutes, puis cela recommence |
+| Attente de sa personnalité d'origine, juste après l'allumage | 5 minutes |
+| Préparation au démarrage | 45 secondes |
+
+Passé ce délai, ou après 20 s sans signe de vie, elle ne répond plus, écrit où elle est bloquée dans le journal, et systemd la relance. **Doly redit alors « Je t'écoute ! »,** sans qu'on lui demande rien. Mesuré sur le robot avec de vrais gels (`kill -STOP`) :
+
+| Gel | Relance par systemd | De nouveau prêt |
+|---|---|---|
+| Micro figé, `arecord` bloqué | 46 s | 69 s |
+| Appli entière figée | 29 s | 48 à 50 s |
+
+**Après 3 échecs en 5 minutes,** il rend la main à sa personnalité d'origine (`OnFailure`). Essayé : 3 gels d'affilée, et elle a repris 154 s après le début du test, sans aide.
+
+**Les moteurs :** si le programme est figé ou tué en plein déplacement, **les chenilles continuent de tourner**, car leur commande reste en place (18 % mesurés sur les sorties du PCA9685, vitesse 20 %). `arreter_moteurs.py` les arrête donc environ 1 s après la fin anormale de l'appli (`ExecStopPost`), puis il baisse les bras. L'appli les arrête aussi à son démarrage. **Limite :** pendant un gel de toute l'appli, rien ne peut les arrêter avant que systemd la tue, soit 30 s au plus. C'est une raison de plus de le faire rouler au sol, loin d'un escalier. Un micro bloqué ne devrait pas laisser tourner les chenilles, car le SDK reste vivant et le déplacement finit normalement : c'est une déduction, pas une mesure. Un bras coupé en plein mouvement finit le geste de quelques degrés (de 73° à 81° pour 120° demandés), puis reste en place sans tomber, et il est rabaissé.
+
+## Son relevé de santé
+
+Toutes les 10 minutes, il écrit une ligne `[sante]` dans le journal : mémoire de l'appli et de la voix, mémoire disponible, fichier d'échange, température, charge du processeur et durées de fonctionnement. Rien que des nombres : aucune phrase dite. Chaque minute, `[batterie]` donne aussi sa place et le courant.
+
+Pour tout résumer en français simple, sur Doly :
+
+```bash
+python3 resumer_journal.py
+python3 resumer_journal.py --depuis "2 hours ago"
+```
+
+Il donne la durée d'écoute la plus longue, l'évolution de la mémoire, les coupures du micro, les erreurs, les gels et les redémarrages. Les durées ne dépendent pas de l'heure du robot, fausse juste après l'allumage. Il n'affiche jamais ce qui a été dit.
+
+**Le test long, le 7 novembre :** 3 h 32 d'écoute d'affilée, sans gel, sans erreur et sans redémarrage, avec 48 phrases. La température n'a pas dépassé 56 °C.
+
+| Moment | Mémoire de l'appli | Mémoire disponible |
+|---|---|---|
+| Au départ | 254 Mo | 440 Mo |
+| Après 1 h et 37 phrases, avec des scènes et des déplacements | 486 Mo | 216 Mo |
+| 2 h 10 plus tard, sans parler | 486 Mo | 213 Mo |
+| Après une dizaine de phrases de plus | 489 Mo | 234 Mo |
+
+Elle monte donc quand on s'en sert, puis se stabilise, et rien n'indique de fuite sur ces heures. Plusieurs jours ou de très longues conversations n'ont pas été mesurés. Sur ce test, les 7 coupures du micro sont toutes arrivées pendant le plus gros saut de mémoire, quand il enchaînait les phrases et les scènes, et aucune pendant les 2 h 10 de repos.
+
+## Sait-il qu'il est sur sa base ?
+
+Oui, d'après le courant de sa batterie, comme l'explique la documentation du SDK (`base.py`, `ina219.py`). Le composant est seulement lu : aucun réglage n'y est écrit. C'est une déduction, pas un capteur de contact. Mesuré en moyenne sur 15 s, en mV sur le shunt :
+
+| Situation | Courant |
+|---|---|
+| Hors de sa base, à l'écoute, en parlant ou en bougeant | -4 à -9 |
+| Hors de sa base, micro coupé | -4,7 |
+| Hors de sa base, endormi | -3,5 |
+| Sur sa base, batterie pleine | -0,2 à 0 |
+| Sur sa base, juste après une petite décharge | +1 à +2,7 |
+| Sur sa base, après une heure hors de sa base (83 %) | +5 |
+| Sur sa base, à 27 % | +4,2 |
+
+Sur une moyenne de 20 s, il se dit sur sa base au-dessus de -1,5, hors de sa base en dessous de -2,5, et il ne sait pas entre les deux, ni pendant les 20 premières secondes, ni si la lecture échoue. Il faut donc une vingtaine de secondes pour qu'il s'en aperçoive.
+
+| Ce qu'il sait | Alerte à 30 % | Extinction sous 15 % | Claude |
+|---|---|---|---|
+| Sur sa base, batterie qui charge | Non | Non | Il le sait |
+| Sur sa base, sans charge nette | Non | Oui, par prudence | Il le sait |
+| Hors de sa base | Oui | Oui | Il le sait |
+| Il ne sait pas | Oui, comme avant | Oui, comme avant | Rien ne lui est dit |
+
+Essayé à trois retraits et trois retours sur la base, et comparé aux gestes faits : tous vus, sans erreur. Claude a répondu juste, sur la base et hors de la base. `doly_battery` reste juste même avec des centaines de lectures par seconde du composant, car le SDK y fait des lectures groupées, où personne ne peut s'intercaler. `python3 mesurer_base.py` affiche le courant en direct.
+
+**Le pourcentage suit la tension de la batterie, pas ce qu'il lui reste vraiment.** Il bondit dès qu'il est posé sur sa base (de 83 à 96 %, de 27 à 38 %), et il chute dès qu'il force (de 94 à 86 % en 20 s, processeur à fond). Un chiffre qui saute ne veut donc rien dire à lui seul.
+
+**La vraie décharge, le 7 novembre :** à 30 %, hors de sa base, il a bien dit « Ma batterie est faible », et il n'a rien répété une fois reposé sur sa base, où la charge a été vue. À l'écoute, il a perdu environ 0,6 point par minute entre 38 et 30 %, contre 0,2 environ au-dessus de 80 %. **Pas essayé en vrai :** il ne s'est pas éteint sous 15 %, et le cas « reste allumé sous 15 % parce qu'il charge » n'est vérifié que par les essais sans matériel.
+
+**Ce qu'il consomme, en mV sur le shunt :** repos 4,4, écrans et LED au maximum 5,8, demi-tours sur place 6,8 en moyenne avec des pointes à 44, processeur à fond 12 à 13. Faire tourner les 4 cœurs le fait monter à 74,5 °C en 80 s avec le ventilateur automatique, mais 66 °C stables avec le ventilateur à fond.
 
 ## Tests guidés
 
@@ -185,7 +266,7 @@ Ces trois scripts sont à lancer sur le robot, à côté de lui. Doly explique c
 | `tester_deplacements.py` | Les petits déplacements, les refus et les arrêts | Au sol, un mètre de libre |
 | `tester_fonctions.py <partie>` | Les yeux, les sons, les réactions, la photo, les jeux et les scènes, voir [GUIDE_DE_TEST.md](GUIDE_DE_TEST.md) | Selon la partie |
 
-`essais_sans_materiel.py` vérifie la logique avec des imitations du matériel (`faux_materiel.py`) : rien ne bouge ni ne sonne, et rien ne part sur Internet.
+`GUIDE_DE_TEST.md` explique aussi comment refaire les tests de solidité. `essais_sans_materiel.py` vérifie la logique avec des imitations du matériel (`faux_materiel.py`) : rien ne bouge ni ne sonne, et rien ne part sur Internet.
 
 ## Bon à savoir
 
@@ -195,7 +276,7 @@ Ces trois scripts sont à lancer sur le robot, à côté de lui. Doly explique c
 - **Coût :** avec Haiku 5.5 (0,10 $ / 0,50 $ par million de tokens), les outils et les consignes font environ 4 700 tokens, gardés en cache pendant 5 minutes. D'après les essais, compte environ 0,06 centime de dollar pour la première phrase, puis 0,01 à 0,03 centime par phrase, tant que vous vous parlez à moins de 5 minutes d'écart. Au-delà de 20 échanges, Doly repart d'une conversation neuve. Ses réactions, ses jeux et ses photos ne coûtent rien.
 - **Crédits épuisés :** Doly dit qu'il n'a plus de crédit, et rien de plus n'est facturé tant que la recharge automatique reste désactivée.
 - **Ventilateur :** la personnalité d'origine étant arrêtée, le script active le mode automatique, qui vise à garder le processeur sous 70 °C.
-- **Mémoire :** à l'écoute, environ 320 Mo restent disponibles sur 907 Mo, et autour de 200 Mo après une longue conversation. L'appli gagne environ 25 Mo pendant ses 10 premières minutes d'écoute, à cause de Vosk, puis se stabilise. Avec les réactions et les nouveaux outils, sur un essai de 22 minutes sans vrai micro, elle est montée de 249 à 339 Mo, et au moins 317 Mo sont restés disponibles. Elle n'a pas encore été mesurée sur plusieurs heures.
+- **Mémoire :** à l'écoute, environ 320 Mo restent disponibles sur 907 Mo, et autour de 200 Mo après une longue conversation. L'appli gagne environ 25 Mo pendant ses 10 premières minutes d'écoute, à cause de Vosk, puis se stabilise. Avec les réactions et les nouveaux outils, sur un essai de 22 minutes sans vrai micro, elle est montée de 249 à 339 Mo, et au moins 317 Mo sont restés disponibles. Sur plusieurs heures, voir « Son relevé de santé » : jusqu'à 489 Mo, stable au repos.
 - **Processeur :** à l'écoute, avec les réactions, environ 24 % d'un cœur sur les quatre. La photo prend environ 3,5 s et pèse 2 Mo.
 - **Son :** rien n'est enregistré sur le disque pendant la conversation.
 - **Fichiers sur le robot :** son caractère (`humeur.json`), son style (`style.json`), la ville retenue (`ville.json`) et les records (`records.json`) sont dans `~/.config/doly/`, hors du dépôt. Les supprimer les remet à zéro.

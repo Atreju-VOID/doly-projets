@@ -2,18 +2,29 @@
 Description=Doly converse en français (mode mains libres)
 # Pas de lien d'ordre avec doly_update : il démarre lui-même après multi-user.target, ce qui créerait une boucle.
 # L'appli attend elle-même que le logiciel d'origine soit prêt (--attendre-origine).
-# Après 3 échecs en 5 minutes, on laisse la main au logiciel d'origine.
+# Après 3 échecs en 5 minutes, on laisse la main au logiciel d'origine. L'appli le relance elle-même en quittant, mais un
+# programme tué parce qu'il était figé ne fait plus rien : OnFailure ne se déclenche qu'une fois ces 3 essais épuisés.
 StartLimitIntervalSec=300
 StartLimitBurst=3
+OnFailure=doly.service
 
 [Service]
-Type=simple
+# L'appli dit READY=1 tout au début, puis prouve qu'elle vit au moins toutes les 30 s (voir garde.py).
+Type=notify
+WatchdogSec=30
+# Une appli figée reçoit SIGABRT, qui écrit dans le journal où elle en était, puis SIGKILL 10 s plus tard.
+TimeoutAbortSec=10
+# Pas de fichier d'image mémoire : il pourrait contenir du son, et il remplirait la carte.
+LimitCORE=0
 User=doly
 WorkingDirectory=/home/doly/doly-projets/projets/doly-conversation
 # Dossier en mémoire pour les phrases à prononcer (/run/doly-francais), supprimé à l'arrêt du service.
 RuntimeDirectory=doly-francais
 ExecStart=/home/doly/doly-env/bin/python converser.py --mains-libres --journal-discret --attendre-origine
 Environment=PYTHONUNBUFFERED=1
+Environment=DOLY_UNITE=%n
+# Un programme figé ou tué laisse les chenilles tourner : celui-ci les arrête s'il n'a pas fini normalement.
+ExecStopPost=/home/doly/doly-env/bin/python arreter_moteurs.py
 Restart=on-failure
 RestartSec=10
 

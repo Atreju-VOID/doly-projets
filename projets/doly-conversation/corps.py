@@ -175,6 +175,8 @@ class Corps:
         rc, *decalages_imu = helper.get_imu_offsets()
         if rc < 0 or drive.init(*decalages_imu) < 0:
             raise RuntimeError("roues indisponibles")
+        # Si le programme précédent est mort en roulant, les chenilles tournent encore : mesuré sur le robot.
+        drive.abort()
         self.etat = None
         self.verrou_proximite = threading.Lock()
         self.numero = 0

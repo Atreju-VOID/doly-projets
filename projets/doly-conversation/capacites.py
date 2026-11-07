@@ -160,12 +160,29 @@ def dire_duree(secondes):
     return " ".join(morceaux)
 
 
+class BaseInconnue:
+    """Quand on ne sait pas où il est : par exemple sans capteur de courant. C'est le cas le plus prudent."""
+
+    def sur_base(self):
+        return None
+
+    def en_charge(self):
+        return False
+
+    def pour_claude(self):
+        return None
+
+    def pour_le_journal(self):
+        return "base inconnue"
+
+
 class Capacites:
-    def __init__(self, corps, voix, humeur, reactions=None):
+    def __init__(self, corps, voix, humeur, reactions=None, base=None):
         self.corps = corps
         self.voix = voix
         self.humeur = humeur
         self.reactions = reactions
+        self.base = base or BaseInconnue()
         self.minuteur = Minuteur()
         self.jeu_demande = None  # le jeu démarre quand Doly a fini sa phrase
         self.en_jeu = False
@@ -181,6 +198,9 @@ class Capacites:
                   f"Heure : {maintenant.tm_hour} h {maintenant.tm_min:02d}.",
                   f"Batterie : {self.corps.batterie()} pour cent.",
                   self.humeur.pour_claude()]
+        ou_il_est = self.base.pour_claude()
+        if ou_il_est:
+            lignes.insert(4, ou_il_est)
         if self.minuteur.actif():
             lignes.append(f"Il reste {dire_duree(self.minuteur.restant())} au minuteur.")
         lignes.extend(self.resultats)

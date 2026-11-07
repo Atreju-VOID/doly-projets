@@ -36,7 +36,11 @@ import numpy as np
 
 import animations
 import capacites
+import base as module_base
 import corps as module_corps
+import garde
+import resumer_journal
+import sante
 import ecran as module_ecran
 import humeur as module_humeur
 import jeux
@@ -1146,6 +1150,7 @@ def essai_conversation():
             self.a_dire = []
             self.guets = 0
             self.muet = False
+            self.micro_bloque = False
 
         def guetter(self, duree_max, au_reveil, interrompre=lambda: False):
             self.guets += 1
@@ -1155,6 +1160,8 @@ def essai_conversation():
                     return "toucher", ""
                 if interrompre():
                     return "rien", ""
+                if not self.micro_bloque:
+                    garde.vivant()  # comme le vrai micro, à chaque bloc de son reçu
                 time.sleep(0.01)
             if self.a_dire:
                 au_reveil()
@@ -1171,8 +1178,10 @@ def essai_conversation():
             debut = time.monotonic()
             while converser.capteur_touche():
                 if self.muet and silence_max is not None and time.monotonic() - debut > silence_max:
+                    garde.vivant()
                     return None, time.monotonic() - debut, time.monotonic()
                 time.sleep(0.01)
+            garde.vivant()
             return "phrase dite au toucher", time.monotonic() - debut + 0.5, time.monotonic()
 
     class FauxCerveau:
@@ -1212,6 +1221,23 @@ def essai_conversation():
     converser.service_doly_actif = lambda: False
 
     fil = threading.Thread(target=lambda: resultat.update(fin=conversation.mains_libres()), daemon=True)
+    # Le chien de garde regarde ce fil pendant tout l'essai : aucune activité normale ne doit le faire réagir.
+    chien = garde._garde
+    chien.fil_surveille = fil
+    chien.patience = 2.5  # à l'échelle de cet essai : un toucher long y dure 1,8 s, et 15 s au plus en vrai pour 20 s de patience
+    chien.dernier_signe = time.monotonic()
+    fausses_alarmes = []
+    surveiller_le_chien = threading.Event()
+    surveiller_le_chien.set()
+
+    def observer_le_chien():
+        while True:
+            if surveiller_le_chien.is_set() and not chien.doit_repondre():
+                pile = traceback.extract_stack(sys._current_frames()[fil.ident])
+                fausses_alarmes.append(" < ".join(f"{cadre.name}:{cadre.lineno}" for cadre in reversed(pile[-4:])))
+            time.sleep(0.05)
+
+    threading.Thread(target=observer_le_chien, daemon=True).start()
     fil.start()
     time.sleep(0.3)
     verifier(voix.phrases and "hé Doly" in voix.phrases[0], "il accueille")
@@ -1252,6 +1278,7 @@ def essai_conversation():
     tapoter(True, False, 0.1)
     time.sleep(0.6)
     verifier(oreille.guets == guets, "après une caresse, le micro reste fermé")
+    time.sleep(chien.patience + 0.3)  # micro fermé exprès, plus longtemps que la patience du chien de garde
     tapoter(True, False, toucher_long)
     time.sleep(0.8)
     verifier(oreille.guets > guets, "un toucher long rouvre le micro")
@@ -1281,6 +1308,7 @@ def essai_conversation():
     voix.sons.clear()
     Reglages.touche_gauche = True
     time.sleep(1.8)
+    verifier(chien.en_cours is not None and chien.en_cours[0] == "doigt gardé posé", f"doigt gardé posé : activité connue : {chien.en_cours}")
     verifier(any("relieve" in s for s in voix.sons) or voix.sons, f"doigt posé sans parler : il réagit : {voix.sons[:1]}")
     Reglages.touche_gauche = False
     time.sleep(0.5)
@@ -1306,11 +1334,12 @@ def essai_conversation():
     # Un jeu démarre après la phrase, et la conversation sait comment il a fini.
     joue = threading.Event()
     ancien = capacites.JEUX["roue"]
-    capacites.JEUX["roue"] = lambda partie: (joue.set(), "La roue : essai.")[1]
+    capacites.JEUX["roue"] = lambda partie: (joue.set(), time.sleep(chien.patience + 0.3), "La roue : essai.")[2]  # un long jeu
     cerveau.outils_a_lancer["on joue"] = [("jouer", {"jeu": "roue"})]
     oreille.a_dire.append("on joue")
     joue.wait(3)
     verifier(joue.is_set(), "le jeu a démarré")
+    time.sleep(chien.patience + 0.5)
     capacites.JEUX["roue"] = ancien
     time.sleep(0.2)
     verifier("La roue : essai." in capa.etat_pour_claude(), "Claude reçoit le résultat du jeu")
@@ -1329,13 +1358,395 @@ def essai_conversation():
     verifier(not capa.minuteur.actif(), "le minuteur est terminé")
     verifier(len(cerveau.recues) == recues, "ce toucher n'a rien envoyé à Claude")
 
+    # Aucune activité normale n'a fait taire le chien de garde.
+    surveiller_le_chien.clear()
+    verifier(not fausses_alarmes, f"pas de fausse alarme du chien de garde pendant le scénario : {len(fausses_alarmes)} {fausses_alarmes[:3]}")
+
+    # Le micro ne donne plus de son : cette fois, il réagit.
+    time.sleep(0.3)
+    oreille.micro_bloque = True
+    verifier(chien.doit_repondre(), "juste après le blocage, il répond encore")
+    time.sleep(chien.patience + 0.3)
+    verifier(not chien.doit_repondre(), "un micro qui ne donne plus de son fait taire le chien de garde")
+    oreille.micro_bloque = False
+    time.sleep(0.3)
+    verifier(chien.doit_repondre(), "il répond de nouveau si le son revient")
+
     # La batterie vide éteint toujours le robot, même après tout ça.
     Reglages.batterie = 10
     time.sleep(1.0)
     verifier(resultat.get("fin") == "eteindre", f"batterie vide : {resultat}")
+    chien.fil_surveille = threading.main_thread()
+    chien.patience = garde.PATIENCE
     Reglages.batterie = 80
     reactions.arreter()
     corps.fermer()
+
+
+def essai_garde():
+    titre("Chien de garde")
+    horloge = FausseHorloge()
+    envois = []
+    piles = []
+    chien = garde.Garde(envoyer=envois.append, horloge=horloge, patience=20, ecrire_pile=lambda: piles.append(1))
+
+    chien.un_tour()
+    verifier(envois == ["WATCHDOG=1"], f"il répond à systemd tant que tout va bien : {envois}")
+    horloge.t += 19
+    chien.un_tour()
+    verifier(len(envois) == 2, "il répond encore juste avant la limite")
+    horloge.t += 2
+    chien.un_tour()
+    verifier(len(envois) == 2, "après 20 s sans signe de vie, il ne répond plus")
+    verifier(piles == [1], "il écrit une fois où le programme est bloqué")
+    horloge.t += 5
+    chien.un_tour()
+    verifier(len(envois) == 2 and piles == [1], "il reste muet, sans répéter son message")
+    chien.vivant()
+    chien.un_tour()
+    verifier(len(envois) == 3 and not chien.en_alerte, "un retard passager ne tue pas l'appli s'il reprend à temps")
+
+    # Une chose longue et normale, dans son délai.
+    with chien.activite("jeu", 900):
+        horloge.t += 800
+        chien.un_tour()
+        verifier(len(envois) == 4, "un long jeu ne le fait pas taire")
+        with chien.activite("parole", 100):
+            horloge.t += 50
+            verifier(chien.doit_repondre(), "une activité dans une autre")
+        verifier(chien.en_cours[0] == "jeu", "l'activité précédente reprend")
+        horloge.t += 101
+        chien.un_tour()
+        verifier(len(envois) == 4 and chien.en_alerte, "un jeu qui dépasse sa durée maximale est un gel")
+    verifier(chien.doit_repondre(), "la fin d'une activité est un signe de vie")
+    chien.un_tour()
+
+    # Un autre fil ne doit pas pouvoir cacher un gel du fil principal.
+    horloge.t += 100
+    chien.fil_surveille = threading.current_thread()
+    chien.dernier_signe = horloge.t - 100
+    fil = threading.Thread(target=chien.vivant)
+    fil.start()
+    fil.join()
+    verifier(not chien.doit_repondre(), "un autre fil ne compte pas comme un signe de vie")
+
+    def activite_dans_un_autre_fil():
+        with chien.activite("depuis un autre fil", 1000):
+            pass
+
+    fil = threading.Thread(target=activite_dans_un_autre_fil)
+    fil.start()
+    fil.join()
+    verifier(chien.en_cours is None and not chien.doit_repondre(), "ni une activité venue d'un autre fil")
+    chien.vivant()
+    verifier(chien.doit_repondre(), "le fil surveillé, lui, compte")
+
+    # Hors du service, il n'y a personne à prévenir, et rien ne doit planter.
+    socket_avant = os.environ.pop("NOTIFY_SOCKET", None)
+    verifier(garde.envoyer_a_systemd("READY=1") is False, "hors du service, rien n'est envoyé")
+    if socket_avant:
+        os.environ["NOTIFY_SOCKET"] = socket_avant
+
+    # Le vrai message, sur un vrai socket.
+    import socket as module_socket
+    chemin = os.path.join(DOSSIER_ESSAI, "notify")
+    recepteur = module_socket.socket(module_socket.AF_UNIX, module_socket.SOCK_DGRAM)
+    recepteur.bind(chemin)
+    recepteur.settimeout(1)
+    os.environ["NOTIFY_SOCKET"] = chemin
+    verifier(garde.envoyer_a_systemd("READY=1") and recepteur.recv(100) == b"READY=1", "le message arrive sur le socket")
+    os.environ["NOTIFY_SOCKET"] = "/inexistant/socket"
+    verifier(garde.envoyer_a_systemd("WATCHDOG=1") is False, "un socket absent ne fait pas planter")
+    del os.environ["NOTIFY_SOCKET"]
+    recepteur.close()
+
+    # Le vrai code du micro : un bloc de son reçu est un signe de vie, un read() bloqué ne l'est pas.
+    os.environ.setdefault("ANTHROPIC_API_KEY", "essai-sans-reseau")
+    import converser
+    bloque = threading.Event()
+    lectures = []
+
+    class FauxTuyau:
+        def read(self, taille):
+            lectures.append(taille)
+            if len(lectures) > 3:
+                bloque.set()
+                time.sleep(60)  # comme arecord figé
+            return b"\0" * taille
+
+    class FauxMicro:
+        stdout = FauxTuyau()
+
+    class FauxGuetteur:
+        def Reset(self):
+            pass
+
+        def AcceptWaveform(self, bloc):
+            return False
+
+        def PartialResult(self):
+            return '{"partial": ""}'
+
+    oreille = object.__new__(converser.Oreille)
+    oreille.guetteur = FauxGuetteur()
+    oreille.duree_guettee = 0.0
+    oreille._ouvrir_micro = lambda: FauxMicro()
+    vrai_chien = garde._garde
+    fil = threading.Thread(target=oreille.guetter, args=(1000, lambda: None), daemon=True)
+    vrai_chien.fil_surveille = fil
+    vrai_chien.patience = 0.3
+    vrai_chien.dernier_signe = time.monotonic() - 100
+    verifier(not vrai_chien.doit_repondre(), "avant le micro, plus de signe de vie")
+    fil.start()
+    bloque.wait(3)
+    verifier(vrai_chien.doit_repondre(), "un bloc de son reçu dans guetter est un signe de vie")
+    time.sleep(0.5)
+    verifier(fil.is_alive() and not vrai_chien.doit_repondre(), "arecord bloqué dans guetter : plus de signe de vie")
+    vrai_chien.fil_surveille = threading.main_thread()
+    vrai_chien.patience = garde.PATIENCE
+
+    # L'attente du logiciel d'origine : assez courte pour que le repli après 3 échecs en 5 minutes reste possible.
+    attente = converser.attente_de_l_origine
+    verifier(attente(False, 0, 10) == 290, "à l'allumage, il attend le logiciel d'origine, 5 minutes au plus après l'allumage")
+    verifier(attente(True, 0, 10) == 0, "il n'attend pas un logiciel déjà là")
+    verifier(attente(False, 1, 60) == 0, "après une relance automatique, il n'attend pas un logiciel qui ne reviendra pas")
+    verifier(attente(False, 0, 4000) == 0, "longtemps après l'allumage, il n'attend pas")
+    temps_d_un_cycle = 6 + converser.PREPARATION_MAX + 30 + 5 + 10  # lancement, préparation, WatchdogSec, moteurs, RestartSec (mesurés)
+    verifier(3 * temps_d_un_cycle <= 300, f"un blocage à chaque préparation fait 3 échecs en 5 minutes : {3 * temps_d_un_cycle} s")
+    verifier(garde.PATIENCE + garde.PERIODE < 30, "le fil répond plusieurs fois pendant le délai de systemd")
+    os.environ["DOLY_UNITE"] = "unite-qui-n-existe-pas.service"
+    verifier(converser.nombre_de_relances() == 0, "une unité inconnue compte pour 0 relance")
+    del os.environ["DOLY_UNITE"]
+    verifier(converser.nombre_de_relances() == 0, "sans unité, 0 relance")
+
+
+def essai_base():
+    titre("Sur sa base ou non")
+    horloge = FausseHorloge()
+    base = module_base.Base(horloge=horloge)
+    verifier(base.sur_base() is None and not base.en_charge() and base.pour_claude() is None, "au début, il ne sait pas")
+
+    def remplir(valeur):
+        for _ in range(module_base.FENETRE):
+            horloge.t += 1
+            base.noter(valeur)
+
+    for _ in range(module_base.FENETRE - 1):
+        base.noter(-5.0)
+    verifier(base.sur_base() is None, "pas assez de lectures : il ne sait pas")
+    # Les valeurs mesurées sur le robot, en moyenne.
+    for valeur, sur_base, charge, texte in [(-6.5, False, False, "hors de sa base, à l'écoute"),
+                                            (-4.7, False, False, "hors de sa base, micro coupé"),
+                                            (-3.5, False, False, "hors de sa base, endormi"),
+                                            (-2.0, None, False, "entre les deux seuils"),
+                                            (-0.2, True, False, "sur sa base, batterie pleine"),
+                                            (0.0, True, False, "sur sa base, batterie pleine"),
+                                            (1.5, True, True, "sur sa base, en charge"),
+                                            (2.7, True, True, "sur sa base, en charge")]:
+        remplir(valeur)
+        verifier(base.sur_base() is sur_base and base.en_charge() is charge, f"{texte} ({valeur} mV) : {base.sur_base()}, {base.en_charge()}")
+    remplir(-5.0)
+    base.noter(40.0)
+    verifier(base.sur_base() is False, "un seul pic ne fait pas croire qu'il est sur sa base")
+    remplir(1.5)
+    for _ in range(3):
+        base.noter(-12.0)
+    verifier(base.sur_base() is True, "un pic de consommation ne fait pas croire qu'il est parti")
+    remplir(1.5)
+    verifier("charge" in base.pour_claude() and "Tu es sur ta base" in base.pour_claude(), base.pour_claude())
+    verifier("sur sa base, +1.50 mV" == base.pour_le_journal(), base.pour_le_journal())
+    remplir(0.0)
+    verifier(base.pour_claude() == "Tu es sur ta base de charge.", f"pleine, on ne dit pas qu'elle charge : {base.pour_claude()}")
+    remplir(-6.0)
+    verifier("pas sur ta base" in base.pour_claude() and "hors de sa base" in base.pour_le_journal(), base.pour_claude())
+    remplir(-2.0)
+    verifier(base.pour_claude() is None and "inconnue" in base.pour_le_journal(), "en cas de doute, on ne dit rien à Claude")
+    remplir(1.5)
+    base.noter(None)
+    verifier(base.sur_base() is None and not base.en_charge(), "une lecture ratée : il ne sait plus")
+    remplir(1.5)
+    horloge.t += module_base.DELAI_MAX + 1
+    verifier(base.sur_base() is None and not base.en_charge(), "des lectures trop anciennes : il ne sait plus")
+
+    # Le capteur manque, ou lâche en route : l'appli continue comme avant, sans planter.
+    class CapteurEnPanne:
+        def __init__(self):
+            raise OSError("pas de bus")
+
+    base = module_base.Base(creer_capteur=CapteurEnPanne)
+    base.demarrer()
+    time.sleep(0.1)
+    verifier(base.sur_base() is None and base.erreur_signalee, "sans capteur, il ne sait pas et il le signale une fois")
+
+    # Ce que cela change dans la conversation, avec le vrai contrôle de la batterie.
+    os.environ.setdefault("ANTHROPIC_API_KEY", "essai-sans-reseau")
+    import converser
+
+    class FausseBase(capacites.BaseInconnue):
+        def __init__(self):
+            self.place, self.charge = None, False
+
+        def sur_base(self):
+            return self.place
+
+        def en_charge(self):
+            return self.charge
+
+    corps, voix = nouveau_corps()
+    converser.service_doly_actif = lambda: False
+    fausse_base = FausseBase()
+    capa = Capacites(corps, voix, Humeur(fichier=FICHIER_HUMEUR), base=fausse_base)
+    conversation = converser.Conversation(voix, None, None, corps, capa, discret=True)
+
+    def controler(batterie, place, charge):
+        Reglages.batterie = batterie
+        fausse_base.place, fausse_base.charge = place, charge
+        conversation.dernier_controle = -1000
+        voix.phrases.clear()
+        return conversation.surveiller(), list(voix.phrases)
+
+    eteindre, phrases = controler(28, None, False)
+    verifier(phrases == [converser.BATTERIE_FAIBLE] and not eteindre, "base inconnue : il prévient, comme avant")
+    eteindre, phrases = controler(28, None, False)
+    verifier(phrases == [], "il ne le répète pas toutes les minutes")
+    eteindre, phrases = controler(28, True, True)
+    verifier(phrases == [], "posé sur sa base : plus d'alerte")
+    eteindre, phrases = controler(28, False, False)
+    verifier(phrases == [converser.BATTERIE_FAIBLE], "retiré de sa base trop tôt : il prévient de nouveau")
+    conversation.alerte_donnee = False
+    eteindre, phrases = controler(28, True, False)
+    verifier(phrases == [], "sur sa base, batterie pleine ou non : pas d'alerte")
+
+    conversation.lectures_critiques = 0
+    verifier(controler(10, True, True)[0] is False and controler(10, True, True)[0] is False, "il charge vraiment : pas d'extinction à 10 %")
+    verifier(controler(10, False, False)[0] is False and controler(10, False, False)[0] is True, "hors de sa base : extinction après 2 lectures")
+    conversation.lectures_critiques = 0
+    verifier(controler(10, True, False)[0] is False and controler(10, True, False)[0] is True, "posé sur sa base sans charger : extinction, c'est le plus prudent")
+    conversation.lectures_critiques = 0
+    verifier(controler(10, None, False)[0] is False and controler(10, None, False)[0] is True, "lecture douteuse : extinction, comme avant")
+    conversation.lectures_critiques = 0
+    controler(10, True, True)
+    verifier(controler(10, False, False)[0] is False, "le décompte repart de zéro s'il chargeait entre-temps")
+    conversation.lectures_critiques = 0
+    capa_sans_base = Capacites(corps, voix, Humeur(fichier=FICHIER_HUMEUR))
+    verifier("base" not in capa_sans_base.etat_pour_claude(), "sans information, rien sur la base pour Claude")
+    verifier(capa_sans_base.base.pour_le_journal() == "base inconnue", "le journal dit qu'il ne sait pas")
+    vraie_base = module_base.Base(horloge=horloge)
+    capa_avec_base = Capacites(corps, voix, Humeur(fichier=FICHIER_HUMEUR), base=vraie_base)
+    for _ in range(module_base.FENETRE):
+        vraie_base.noter(1.5)
+    etat = capa_avec_base.etat_pour_claude()
+    verifier("Tu es sur ta base de charge, et ta batterie charge." in etat and "Batterie : " in etat, etat)
+    for phrase in ("Date", "Heure", "Batterie"):
+        verifier(phrase in etat, f"le reste du message est là : {etat}")
+    Reglages.batterie = 80
+    corps.fermer()
+
+    # L'appli qui repart arrête des chenilles qui tourneraient encore.
+    journal.clear()
+    corps = Corps()
+    verifier(appels("drive", "abort"), "au démarrage, l'appli arrête les chenilles")
+    corps.fermer()
+
+    # La fin anormale de l'appli arrête les moteurs ; une fin normale n'y touche pas.
+    import arreter_moteurs
+    journal.clear()
+    os.environ["SERVICE_RESULT"] = "success"
+    arreter_moteurs.main()
+    verifier(not journal, "fin normale : il ne touche à rien")
+    for resultat in ("watchdog", "signal", "exit-code", "core-dump", "timeout"):
+        journal.clear()
+        os.environ["SERVICE_RESULT"] = resultat
+        arreter_moteurs.main()
+        verifier(appels("drive", "abort") and appels("arm", "set_angle"), f"fin anormale ({resultat}) : moteurs arrêtés et bras baissés")
+    del os.environ["SERVICE_RESULT"]
+
+
+def essai_sante():
+    titre("Relevé de santé")
+    mesures = sante.mesurer(time.monotonic() - 100, os.getpid())
+    verifier(all(valeur is not None for valeur in mesures.values()), f"tout se lit sur le robot : {mesures}")
+    verifier(0 < mesures["appli"] < 900 and 0 < mesures["dispo"] < 907, f"mémoires plausibles : {mesures}")
+    verifier(0 < mesures["temp"] < 100, f"température plausible : {mesures['temp']}")
+    verifier(99 < mesures["appli_depuis"] < 200, f"durée de fonctionnement : {mesures['appli_depuis']}")
+    ligne = sante.ligne_de_sante(mesures)
+    import re
+    verifier(re.fullmatch(r"\[sante\]( \w+=[\d.]+(Mo|C|s)?){8}", ligne), f"que des nombres : {ligne}")
+    vide = {cle: None for cle in mesures}
+    verifier(sante.ligne_de_sante(vide).count("?") == 8, "une valeur illisible n'empêche pas d'écrire la ligne")
+    verifier(sante.memoire_du_programme(99999999) is None, "un programme disparu ne fait pas planter")
+    verifier(sante.memoire_du_systeme("/inexistant") == (None, None), "un fichier illisible ne fait pas planter")
+    verifier(sante._premier_nombre("/inexistant") is None, "une température illisible ne fait pas planter")
+    verifier(sante.PERIODE == 600, "un relevé toutes les 10 minutes")
+
+    titre("Résumé du journal")
+    relevé = "[sante] appli={}Mo piper=90Mo dispo={}Mo echange=1Mo temp={}C charge=1.20 appli_depuis={}s robot_depuis=200s"
+    entrees = [
+        # Un premier lancement, de 10 minutes, qui finit par un gel.
+        ("A", 1, 100.0, "[info] Préparation, modèle essai ..."),
+        ("A", 1, 110.0, "[info] Prêt."),
+        ("A", 1, 170.0, "[batterie] 90 %, hors de sa base, -5.00 mV"),
+        ("A", 1, 200.0, "overrun!!! (at least 250.5 ms long)"),
+        ("A", 1, 300.0, "overrun!!! (at least 50.0 ms long)"),
+        ("A", 1, 400.0, "[erreur] pas de connexion"),
+        ("A", 1, 500.0, "[erreur] pas de connexion"),
+        ("A", 1, 700.0, "[garde] Plus de signe de vie depuis 21 s. systemd va me relancer."),
+        ("A", None, 730.0, "doly-francais.service: Watchdog timeout (limit 30s)!"),
+        ("A", None, 745.0, "doly-francais.service: Scheduled restart job, restart counter is at 1."),
+        # Un deuxième, plus long, avec des relevés.
+        ("A", 2, 750.0, "[info] Prêt."),
+        ("A", 2, 751.0, relevé.format(300, 320, "50.5", 1)),
+        ("A", 2, 751.0 + 3600, relevé.format(310, 300, "55.0", 3601)),
+        ("A", 2, 751.0 + 7200, relevé.format(320, 310, "52.0", 7201)),
+        ("A", 2, 8000.0, "[mesure] fin de ta phrase puis premier son : 2.00 s (transcription 0.10 s, premier mot de Claude 1.00 s)"),
+        ("A", 2, 8100.0, "Traceback (most recent call last):"),
+        ("A", None, 8110.0, "doly-francais.service: Start request repeated too quickly."),
+        # Un autre démarrage : ses secondes repartent de zéro, et l'horloge du jour n'intervient pas.
+        ("B", 1, 5.0, "[info] Prêt."),
+        ("B", 1, 65.0, "[batterie] 80 %"),
+        ("B", 1, 125.0, "[batterie] 81 %, sur sa base, +1.50 mV"),
+        ("B", 1, 185.0, "[batterie] 82 %, base inconnue"),
+    ]
+    resume = resumer_journal.resumer(entrees)
+    verifier(len(resume["seances"]) == 3, f"3 lancements : {resume['seances']}")
+    verifier(resume["seances"][0]["fin"] == 700.0, "un lancement finit à sa dernière ligne, pas au message de systemd")
+    verifier(resume["coupures"] == 2 and resume["coupures_longues"] == 1 and resume["coupure_max"] == 250.5, f"coupures : {resume}")
+    verifier(resume["erreurs"] == {"pas de connexion": 2}, f"erreurs : {resume['erreurs']}")
+    verifier(resume["gels"] == 1 and resume["alertes_garde"] == 1, "un gel")
+    verifier(resume["relances"] == 1 and resume["abandons"] == 1 and resume["plantages"] == 1, f"relances : {resume}")
+    verifier(resume["phrases"] == 1, "une phrase")
+    texte = resumer_journal.en_francais(resume)
+    verifier("3 lancement(s)" in texte and "2 h 02 d'affilée" in texte, texte)
+    verifier("de 300 à 320 Mo" in texte and "Sur la dernière heure : +10 Mo" in texte, texte)
+    # Une heure de conversation puis une heure sans bouger : la dernière heure ne doit plus rien montrer.
+    plateau = [("C", 1, 5.0, "[info] Prêt."),
+               ("C", 1, 2000.0, relevé.format(400, 300, "50.0", 1995)),
+               ("C", 1, 5400.0, relevé.format(486, 210, "50.0", 5395)),
+               ("C", 1, 9000.0, relevé.format(486, 212, "50.0", 8995))]
+    verifier("Sur la dernière heure : +0 Mo" in resumer_journal.en_francais(resumer_journal.resumer(plateau)), "un plateau se voit")
+    trop_court = [("C", 1, 5.0, "[info] Prêt."),
+                  ("C", 1, 600.0, relevé.format(254, 440, "50.0", 595)),
+                  ("C", 1, 2500.0, relevé.format(300, 400, "50.0", 2495))]
+    verifier("dernière heure" not in resumer_journal.en_francais(resumer_journal.resumer(trop_court)), "pas de chiffre sur moins d'une heure")
+    verifier("la mémoire disponible de 320 à 310 Mo" in texte, texte)
+    verifier("55 °C" in texte, texte)
+    verifier("Coupures du micro : 2, dont 1 de plus de 0.2 s, jusqu'à 0.25 s." in texte, texte)
+    verifier("pas de connexion (2 fois)" in texte, texte)
+    verifier("Gels détectés par le chien de garde : 1." in texte and "Redémarrages automatiques : 1." in texte, texte)
+    verifier("personnalité d'origine : 1 fois" in texte, texte)
+    verifier("Sa place : 1 min sur sa base, 1 min hors de sa base." in texte, texte)
+    verifier("Batterie : 80 % au plus bas." in texte, texte)
+    lignes = [json.dumps({"_BOOT_ID": "A", "_PID": "1", "__MONOTONIC_TIMESTAMP": "2000000", "MESSAGE": "[info] Prêt."}),
+              "pas du json",
+              json.dumps({"_BOOT_ID": "A", "_PID": "1", "__MONOTONIC_TIMESTAMP": "5000000", "MESSAGE": [91, 98, 93, 255]})]
+    entrees_lues = list(resumer_journal.lire_entrees(lignes))
+    verifier(len(entrees_lues) == 2 and entrees_lues[0][2] == 2.0, f"lecture du JSON du journal : {entrees_lues}")
+    verifier(entrees_lues[1][3].startswith("[b]"), f"un message qui n'est pas de l'UTF-8 ne fait pas planter : {entrees_lues[1]}")
+    sans_rien = resumer_journal.en_francais(resumer_journal.resumer([]))
+    verifier("aucun lancement" in sans_rien and "Erreurs : aucune" in sans_rien, sans_rien)
+    # Les erreurs affichées ne viennent que de messages fixes : les phrases dites n'ont pas d'étiquette [erreur].
+    avec_phrase = resumer_journal.resumer([("A", 1, 1.0, "[toi] ma phrase secrète"), ("A", 1, 2.0, "[info] Prêt."), ("A", 1, 3.0, "[toi] autre chose")])
+    verifier("secrète" not in resumer_journal.en_francais(avec_phrase), "les phrases dites n'apparaissent jamais dans le résumé")
 
 
 def main():
@@ -1350,7 +1761,8 @@ def main():
     tous = {
         "humeur": essai_humeur, "meteo": essai_meteo, "animations": essai_animations, "lecture": essai_lecture_precise,
         "ecran": essai_ecran, "reactions": essai_reactions, "capacites": essai_capacites, "jeux": essai_jeux,
-        "toucher": essai_toucher, "cerveau": essai_cerveau, "conversation": essai_conversation,
+        "toucher": essai_toucher, "cerveau": essai_cerveau, "conversation": essai_conversation, "garde": essai_garde,
+        "sante": essai_sante, "base": essai_base,
     }
     for nom, essai in tous.items():
         if options.essais and nom not in options.essais:
