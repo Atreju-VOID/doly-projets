@@ -136,9 +136,47 @@ Pour lui parler sans le toucher :
 - **« Ne m'écoute plus » :** il coupe son micro jusqu'à ce que tu lui parles en gardant le doigt posé. Une simple caresse ne le rouvre pas.
 - **« Reprends ta personnalité » :** il rend la main à sa personnalité d'origine.
 
-**Ce qui part sur Internet :** l'écoute de « Hé Doly » se fait sur le robot, et rien ne sort tant qu'il ne l'a pas entendu. Ensuite, seul le texte de ta phrase part vers Claude, ainsi que ce que tu dis dans les 5 secondes qui suivent sa réponse, et la date, sa batterie et son humeur. Ce qui a été dit avant « Hé Doly » n'est ni transcrit, ni envoyé. Si Doly se réveille par erreur, ce qui suit partira quand même : dis « ne m'écoute plus » si cela arrive trop souvent.
+**Ce qui part sur Internet :** l'écoute de « Hé Doly » se fait sur le robot, et rien ne sort tant qu'il ne l'a pas entendu. Ensuite, seul le texte de ta phrase part vers Claude, ainsi que ce que tu dis dans les 5 secondes qui suivent sa réponse, et la date, sa batterie et son humeur. Ce qui a été dit avant « Hé Doly » n'est ni transcrit, ni envoyé. Si Doly se réveille par erreur, ce qui suit partira quand même : dis « ne m'écoute plus » si cela arrive trop souvent. Dès qu'il entend son nom, il prépare aussi Claude à répondre vite (voir « Écoute et rapidité ») : cette demande ne contient que la conversation déjà envoyée, jamais ta nouvelle phrase. Le son, lui, ne quitte jamais le robot.
 
 Ses réactions spontanées, ses jeux et ses photos ne sortent pas du robot. Claude ne voit jamais les photos. Pour la météo, seule une position arrondie à environ 10 km, ou le nom de la ville demandée, part vers [Open-Meteo](https://open-meteo.com), un service gratuit pour un usage personnel non commercial, et seulement quand tu demandes la météo (données sous licence CC BY 4.0). Sans ville précisée, il utilise la position enregistrée par l'appli officielle dans les réglages du robot, ou la ville que tu lui as demandé de retenir.
+
+## Écoute et rapidité
+
+**Essayé sur le robot le 9 novembre**, avec le test guidé de [GUIDE_DE_TEST.md](GUIDE_DE_TEST.md#écoute-et-rapidité). Les résultats sont plus bas.
+
+| Changement | Pourquoi | Réglage |
+|---|---|---|
+| **Le micro est lu sans perte.** Un fil ne fait que lire le micro et ranger le son dans une file, que Vosk vide de son côté (`micro.py`). | Avant, Vosk et le micro étaient lus à tour de rôle : si Vosk prenait du retard, `arecord` perdait du son. 23 coupures sur 165 phrases, jusqu'à 0,75 s, dont 9 dans les 6 s après un « Hé Doly ». Autre cause possible : sur le test de 3 h 32, les 7 coupures sont toutes arrivées pendant des scènes enchaînées, quand l'échange est passé de 17 à 128 Mo. Chaque coupure est donc notée avec l'état de la file, la charge, la mémoire disponible et l'échange, pour départager les deux. | `TAMPON_MICRO`, inutilisé pour l'instant |
+| **La mesure part de la vraie fin de ta voix**, le dernier moment où le son était assez fort. Elle dit aussi quand le premier geste ou outil a commencé, et combien d'appels à Claude il a fallu. | En mains libres, la mesure partait du moment où Vosk jugeait ta phrase finie, et oubliait environ 1 s. Quand Claude enchaîne des déplacements sans rien dire d'abord, le premier son arrivait jusqu'à 15 s plus tard : on verra si l'attente vient des gestes ou des allers-retours avec Claude. | |
+| **Le cache de Claude se prépare dès « Hé Doly »**, pendant que tu finis ta phrase, ou dès le bip au toucher. Une fois par réveil, et seulement s'il a refroidi, après 4 minutes sans échange. | Premier mot de Claude mesuré à 2,18 s cache froid, contre 1,29 s cache chaud. Les consignes et les outils ont aussi leur propre point de cache : avant, une conversation neuve repartait toujours à froid. | `--sans-prechauffage` |
+| **Ses phrases fixes sont gardées sur le disque** : « Je t'écoute ! », « Je n'ai rien compris », les messages d'erreur... | Piper ne les calcule plus qu'une fois, la première fois qu'il les dit. Elles sont refaites seules si leur texte ou la voix changent. | |
+| **Un petit son d'attente**, deux notes aiguës et brèves, 0,28 s en tout, si Claude n'a rien dit 2,5 s après l'envoi de ta phrase. Une fois par réponse. | Pour savoir qu'il réfléchit, sans couvrir sa réponse. Il passe aussi quand Claude commence par un geste sans rien dire. | `ATTENTE_AVANT_SON`, `--sans-son-d-attente` |
+| **La fin de phrase au volume**, en mains libres : un court silence après ta voix conclut ta phrase, au lieu d'attendre Vosk. **Désactivée** tant que le test n'a pas montré qu'elle ne te coupe pas la parole. | Gagner une partie de la seconde d'attente. | `--fin-au-volume`, 0,7 s par défaut, ou `--fin-au-volume 1.0` |
+
+Les réglages en majuscules sont en haut de `converser.py`, les autres sont des options de lancement.
+
+**Ce que cela ajoute en mémoire :** presque rien, car l'appli monte déjà jusqu'à 489 Mo sur 907. La file du micro garde 10 s de son au plus, soit 320 Ko. Les phrases fixes sont sur le disque, pas en mémoire, et le son d'attente pèse 12 Ko.
+
+**Le préchauffage du cache :** une demande à Claude sans réponse demandée (`max_tokens` à 0), avec les consignes, les outils et la conversation déjà connue. Avec Haiku 5.5, préparer environ 4 700 tokens coûte environ 0,06 centime de dollar, et la vraie phrase relit ensuite ce cache au lieu de l'écrire : en tout, cela ne coûte presque rien de plus. Un réveil par erreur coûte ces 0,06 centime. Si l'API refuse la demande, il arrête de préchauffer jusqu'au prochain lancement, et la conversation continue comme avant. Une phrase dite juste après son nom attend le préchauffage 1,5 s au plus, car un appel lancé en même temps repartirait à froid.
+
+**Ses phrases fixes sur le disque :** dans `~/.cache/doly/phrases`, environ 2 Mo. C'est sa propre voix, rien de ce que tu dis. Chacune est gardée la première fois qu'il la dit. Les préparer toutes d'avance a été essayé : Piper prenait alors le processeur à Vosk pendant qu'il écoutait, et ta première phrase avait 9,6 s de retard. Tu peux supprimer ce dossier : elles seront refaites.
+
+**Le test de compréhension :** `tester_comprehension.py` te fait répéter 10 phrases dans 4 situations (à 1 m, à 3 m, télé allumée, une autre voix), et donne la part des mots compris. Il dira s'il faut un meilleur moteur de reconnaissance. Le grand modèle Vosk français ne tient pas dans sa mémoire, et envoyer le son sur Internet demanderait ton accord : rien n'est changé avant ce test. Les enregistrements restent sur le robot, dans `~/doly-comprehension`, et le programme ne les efface jamais : supprime le dossier pour les effacer.
+
+### Mesuré sur le robot, le 9 novembre
+
+| Situation | Mots compris | Phrases entièrement comprises | « Hé Doly » reconnu | Calcul de Vosk, pour 1 s de son |
+|---|---|---|---|---|
+| À 1 m | 95 % | 8 sur 10 | 10 sur 10 | 0,42 s |
+| À 3 m | 83 % | 6 sur 10 | 10 sur 10 | 0,53 s |
+| Télé allumée | 69 % | 2 sur 10 | 10 sur 10 | 0,87 s, et jusqu'à 1,5 s |
+| Une autre voix | 53 % | 2 sur 10 | 5 sur 10 | 1,00 s |
+
+- **Vosk ralentit avec le bruit ou une voix qu'il connaît mal**, jusqu'à aller moins vite que la parole. C'est la cause du retard du micro : la file a gardé jusqu'à 3 s de son en attente pendant des conversations normales, sans rien perdre. Avant l'étape 2, ce retard faisait perdre du son. Il ralentit aussi la première fois qu'il entend des mots : 4,5 s de calcul pour 4,7 s de son, puis 0,8 s pour la même phrase. Réchauffer Vosk avec 7 phrases au démarrage ne gagne que 15 à 20 %.
+- **Les confusions déjà connues reviennent** : « vert » devient « verre » ou « envers », « mets » devient « mais ».
+- **Le préchauffage marche** : la première phrase après un réveil relit les 4 550 tokens préparés dès « Hé Doly ».
+- **Délais de réponse** sur une dizaine de phrases, depuis la fin de ta voix : de 3,3 à 4 s pour une réponse simple, jusqu'à 7 s quand Vosk avait 3 s de retard, et 8,4 s avec la météo.
+- **Les phrases fixes ne sont plus préparées d'avance** : cela faisait travailler Piper pendant que Vosk écoutait, et la première réponse avait 16,7 s de retard.
 
 ## Démarrage automatique
 
@@ -166,7 +204,7 @@ sudo systemctl stop doly-francais
 
 **Avant de l'installer, à savoir :**
 
-- **Micro :** il reste ouvert en permanence, sauf quand Doly parle ou après « ne m'écoute plus ». Le son reste en mémoire vive, 8 secondes au plus, et aucun fichier de son n'est écrit sur le disque. Tes phrases n'apparaissent pas dans le journal du robot.
+- **Micro :** il reste ouvert en permanence, sauf quand Doly parle ou après « ne m'écoute plus ». Le son reste en mémoire vive : 8 secondes au plus pour comprendre « Hé Doly » et la suite d'une traite, et 10 secondes au plus en attente de la reconnaissance vocale. Aucun fichier de ton son n'est écrit sur le disque, sauf pendant le test de compréhension. Tes phrases n'apparaissent pas dans le journal du robot.
 - **Sa personnalité d'origine :** elle ne tourne plus, sauf si tu la demandes ou si l'appli échoue 3 fois en 5 minutes. Elle reprend alors la main toute seule.
 - **Sa batterie :** il ne retourne pas seul sur sa base. À 30 %, il demande qu'on l'y pose, sauf s'il y est déjà, et il s'éteint une vingtaine de minutes plus tard. Sous 15 %, confirmé par 2 lectures à une minute d'écart, il s'éteint, sauf si la batterie charge vraiment, et il faut ensuite le rallumer à la main. Le niveau affiché est plus haut sur la base : sa lecture est passée de 47 % à 34 % en une minute à sa sortie de la base. S'il ne sait pas où il est, il garde le comportement le plus prudent : il prévient et il s'éteint. Ces seuils viennent de deux décharges mesurées. L'alerte et l'extinction ont été vérifiées une fois sur le robot, avant la détection de la base : annonces entendues, et arrêt propre confirmé par le journal, à 12 %.
 - **Ses mises à jour :** l'appli laisse d'abord démarrer sa personnalité d'origine pour ne pas les gêner, mais ce mode n'a pas encore été observé pendant une vraie mise à jour.
@@ -212,6 +250,8 @@ python3 resumer_journal.py --depuis "2 hours ago"
 ```
 
 Il donne la durée d'écoute la plus longue, l'évolution de la mémoire, les coupures du micro, les erreurs, les gels et les redémarrages. Les durées ne dépendent pas de l'heure du robot, fausse juste après l'allumage. Il n'affiche jamais ce qui a été dit.
+
+Il donne aussi les délais de réponse : la médiane, 9 sur 10 en dessous de combien, et le plus long, séparément depuis la fin de ta voix et depuis le doigt levé, puis avec et sans geste ou outil, puis le premier mot de Claude, les préchauffages du cache et les petits sons d'attente. Les mesures d'avant l'étape 2 ne comptent pas dans les délais, car en mains libres elles oubliaient environ 1 s. Pour le micro, il dit combien de coupures sont arrivées alors que la file était presque vide, donc alors que Vosk suivait, combien de son a attendu dans la file au plus, et l'échange, la mémoire disponible et la charge au moment des coupures.
 
 **Le test long, le 7 novembre :** 3 h 32 d'écoute d'affilée, sans gel, sans erreur et sans redémarrage, avec 48 phrases. La température n'a pas dépassé 56 °C.
 
@@ -265,19 +305,20 @@ Ces trois scripts sont à lancer sur le robot, à côté de lui. Doly explique c
 | `tester_capteurs.py` | Les capteurs de vide et d'obstacle, sans bouger les roues | Au sol |
 | `tester_deplacements.py` | Les petits déplacements, les refus et les arrêts | Au sol, un mètre de libre |
 | `tester_fonctions.py <partie>` | Les yeux, les sons, les réactions, la photo, les jeux et les scènes, voir [GUIDE_DE_TEST.md](GUIDE_DE_TEST.md) | Selon la partie |
+| `tester_comprehension.py` | Ce qu'il comprend à 1 m, à 3 m, télé allumée et avec une autre voix, voir « Écoute et rapidité » | Dans une pièce où tu peux t'éloigner de 3 m |
 
-`GUIDE_DE_TEST.md` explique aussi comment refaire les tests de solidité. `essais_sans_materiel.py` vérifie la logique avec des imitations du matériel (`faux_materiel.py`) : rien ne bouge ni ne sonne, et rien ne part sur Internet.
+`GUIDE_DE_TEST.md` explique aussi comment refaire les tests de solidité. `essais_sans_materiel.py` vérifie la logique avec des imitations du matériel (`faux_materiel.py`) : rien ne bouge ni ne sonne, et rien ne part sur Internet. `essais_sur_pc.py` lance sur un PC ceux qui n'ont pas besoin du robot.
 
 ## Bon à savoir
 
 - **Modèle :** `claude-haiku-5-5`, avec `effort` bloqué sur `low`. Les deux se règlent en haut de `converser.py`.
-- **Délai mesuré sur le robot :** le premier son arrive environ 2 s après le doigt levé pour une réponse simple, et 2,5 à 6 s quand il y a des gestes ou un premier appel à froid. En mains libres, ajoute environ 1 s, le temps qu'il comprenne que ta phrase est finie.
+- **Délai mesuré sur le robot :** le premier son arrive environ 2 s après le doigt levé pour une réponse simple, et 2,5 à 6 s quand il y a des gestes ou un premier appel à froid. En mains libres, ajoute environ 1 s, le temps qu'il comprenne que ta phrase est finie. Sur 165 phrases, le 7 novembre : médiane 2,61 s, 9 sur 10 sous 4,56 s, au plus 9,92 s, sans compter cette seconde. Depuis l'étape 2, la mesure la compte, ainsi que le retard de Vosk : de 3,3 à 4 s pour une réponse simple le 9 novembre, voir « Écoute et rapidité ».
 - **Autonomie à l'écoute :** de 38 % à la coupure en 42 minutes lors d'une décharge, de 34 % à l'extinction en 27 minutes lors d'une autre. Elle n'a jamais été mesurée depuis une charge complète.
 - **Coût :** avec Haiku 5.5 (0,10 $ / 0,50 $ par million de tokens), les outils et les consignes font environ 4 700 tokens, gardés en cache pendant 5 minutes. D'après les essais, compte environ 0,06 centime de dollar pour la première phrase, puis 0,01 à 0,03 centime par phrase, tant que vous vous parlez à moins de 5 minutes d'écart. Au-delà de 20 échanges, Doly repart d'une conversation neuve. Ses réactions, ses jeux et ses photos ne coûtent rien.
 - **Crédits épuisés :** Doly dit qu'il n'a plus de crédit, et rien de plus n'est facturé tant que la recharge automatique reste désactivée.
 - **Ventilateur :** la personnalité d'origine étant arrêtée, le script active le mode automatique, qui vise à garder le processeur sous 70 °C.
 - **Mémoire :** à l'écoute, environ 320 Mo restent disponibles sur 907 Mo, et autour de 200 Mo après une longue conversation. L'appli gagne environ 25 Mo pendant ses 10 premières minutes d'écoute, à cause de Vosk, puis se stabilise. Avec les réactions et les nouveaux outils, sur un essai de 22 minutes sans vrai micro, elle est montée de 249 à 339 Mo, et au moins 317 Mo sont restés disponibles. Sur plusieurs heures, voir « Son relevé de santé » : jusqu'à 489 Mo, stable au repos.
 - **Processeur :** à l'écoute, avec les réactions, environ 24 % d'un cœur sur les quatre. La photo prend environ 3,5 s et pèse 2 Mo.
-- **Son :** rien n'est enregistré sur le disque pendant la conversation.
+- **Son :** rien de ce que tu dis n'est enregistré sur le disque pendant la conversation. Seules ses phrases fixes, avec sa propre voix, sont gardées dans `~/.cache/doly/phrases`.
 - **Fichiers sur le robot :** son caractère (`humeur.json`), son style (`style.json`), la ville retenue (`ville.json`) et les records (`records.json`) sont dans `~/.config/doly/`, hors du dépôt. Les supprimer les remet à zéro.
 - **Limites actuelles :** Doly ne voit pas et ne va pas sur Internet, sauf pour la météo, et il le dit quand on le lui demande.

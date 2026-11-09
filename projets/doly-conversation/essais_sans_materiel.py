@@ -6,6 +6,7 @@ Vérifie la logique des fonctions de Doly avec des imitations du matériel (faux
 sonne et rien ne part sur Internet. Ces essais lisent les animations d'origine, il faut donc les lancer sur le robot.
 
 Ils ne remplacent pas le test guidé (tester_fonctions.py) : ils ne disent rien des vrais capteurs, des sons ni de l'aspect.
+Ceux de l'écoute et de la rapidité tournent aussi sur un PC : voir essais_sur_pc.py.
 
 Usage, sur le robot :
     ~/doly-env/bin/python essais_sans_materiel.py
@@ -1132,7 +1133,7 @@ def essai_cerveau():
     reponses.append(Reponse([]))
     cerveau.repondre("il reste combien", dites.append, lambda: True)
     verifier([m["role"] for m in cerveau.messages[3:]] == ["user", "system", "assistant", "user"], "historique après un outil")
-    verifier(len({d["system"] for d in envois}) == 1, "les consignes ne changent jamais pendant la conversation")
+    verifier(len({json.dumps(d["system"]) for d in envois}) == 1, "les consignes ne changent jamais pendant la conversation")
     verifier(all(d["tools"] is capacites.OUTILS for d in envois), "les outils ne changent jamais pendant la conversation")
     cerveau.oublier()
     verifier(cerveau.messages == [] and cerveau.echanges == 0, "oublier repart à zéro")
@@ -1151,6 +1152,7 @@ def essai_conversation():
             self.guets = 0
             self.muet = False
             self.micro_bloque = False
+            self.fin_de_voix = None
 
         def guetter(self, duree_max, au_reveil, interrompre=lambda: False):
             self.guets += 1
@@ -1189,11 +1191,16 @@ def essai_conversation():
             self.capa = capa
             self.recues = []
             self.premier_mot = 0.1
+            self.attente_cache = 0.0
             self.outils_a_lancer = {}
             self.oublis = 0
+            self.prechauffages = 0
 
         def oublier(self):
             self.oublis += 1
+
+        def prechauffer(self):
+            self.prechauffages += 1
 
         def repondre(self, texte, dire, actif):
             self.recues.append(texte)
@@ -1246,6 +1253,7 @@ def essai_conversation():
     oreille.a_dire.append("quelle heure est-il")
     time.sleep(0.5)
     verifier(cerveau.recues == ["quelle heure est-il"], f"phrase reçue : {cerveau.recues}")
+    verifier(cerveau.prechauffages == 1, f"le cache se prépare dès son nom, une fois : {cerveau.prechauffages}")
 
     # Pendant un toucher, les réactions aux chocs sont suspendues : une tape secoue le robot.
     time.sleep(0.3)
@@ -1460,48 +1468,48 @@ def essai_garde():
     del os.environ["NOTIFY_SOCKET"]
     recepteur.close()
 
-    # Le vrai code du micro : un bloc de son reçu est un signe de vie, un read() bloqué ne l'est pas.
+    # Le vrai code du micro, avec un faux arecord qui donne 3 blocs puis se fige : un bloc de son reçu est un signe de
+    # vie, un micro qui se tait ne l'est pas, même si la boucle continue de regarder le toucher.
     os.environ.setdefault("ANTHROPIC_API_KEY", "essai-sans-reseau")
     import converser
+    import micro as module_micro
     bloque = threading.Event()
-    lectures = []
-
-    class FauxTuyau:
-        def read(self, taille):
-            lectures.append(taille)
-            if len(lectures) > 3:
-                bloque.set()
-                time.sleep(60)  # comme arecord figé
-            return b"\0" * taille
-
-    class FauxMicro:
-        stdout = FauxTuyau()
+    arreter = threading.Event()
+    recus = []
 
     class FauxGuetteur:
         def Reset(self):
             pass
 
         def AcceptWaveform(self, bloc):
+            recus.append(bloc)
+            if len(recus) >= 3:
+                bloque.set()
             return False
 
         def PartialResult(self):
             return '{"partial": ""}'
 
+    micros = []
     oreille = object.__new__(converser.Oreille)
     oreille.guetteur = FauxGuetteur()
     oreille.duree_guettee = 0.0
-    oreille._ouvrir_micro = lambda: FauxMicro()
+    oreille._ouvrir_micro = lambda: micros.append(module_micro.Micro(faux_arecord(3, attente_fin=60))) or micros[-1]
     vrai_chien = garde._garde
-    fil = threading.Thread(target=oreille.guetter, args=(1000, lambda: None), daemon=True)
+    fil = threading.Thread(target=oreille.guetter, args=(1000, lambda: None, arreter.is_set), daemon=True)
     vrai_chien.fil_surveille = fil
     vrai_chien.patience = 0.3
     vrai_chien.dernier_signe = time.monotonic() - 100
     verifier(not vrai_chien.doit_repondre(), "avant le micro, plus de signe de vie")
     fil.start()
-    bloque.wait(3)
+    bloque.wait(10)
     verifier(vrai_chien.doit_repondre(), "un bloc de son reçu dans guetter est un signe de vie")
-    time.sleep(0.5)
-    verifier(fil.is_alive() and not vrai_chien.doit_repondre(), "arecord bloqué dans guetter : plus de signe de vie")
+    time.sleep(0.6)
+    verifier(fil.is_alive() and not vrai_chien.doit_repondre(), "arecord figé dans guetter : plus de signe de vie")
+    arreter.set()
+    fil.join(5)
+    verifier(not fil.is_alive(), "guetter s'arrête quand même : la boucle n'est pas bloquée sur le micro")
+    verifier(micros and micros[0].processus.poll() is not None, "et le micro figé est bien arrêté")
     vrai_chien.fil_surveille = threading.main_thread()
     vrai_chien.patience = garde.PATIENCE
 
@@ -1753,6 +1761,680 @@ def essai_sante():
     verifier("secrète" not in resumer_journal.en_francais(avec_phrase), "les phrases dites n'apparaissent jamais dans le résumé")
 
 
+# --- Écoute et rapidité ---------------------------------------------------------------------------------------------
+# Ces essais n'utilisent ni les animations ni le vrai micro : ils tournent aussi sur un PC, avec des imitations de Vosk,
+# d'audioop et d'anthropic (voir GUIDE_DE_TEST.md).
+
+# Un faux arecord : des blocs de 0,1 s numérotés (chaque octet vaut le numéro du bloc), un message facultatif sur sa
+# sortie d'erreur après le deuxième bloc, puis une attente, comme un micro figé. Il peut aussi ignorer SIGTERM.
+FAUX_ARECORD = r"""
+import signal, sys, time
+blocs, pause, message, attente_fin, tetu = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3], float(sys.argv[4]), sys.argv[5]
+if tetu == "1" and hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+for numero in range(blocs):
+    sys.stdout.buffer.write(bytes([numero % 256]) * 3200)
+    sys.stdout.buffer.flush()
+    if message and numero == 1:
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+    time.sleep(pause)
+time.sleep(attente_fin)
+"""
+
+
+def faux_arecord(blocs, pause=0.0, message="", attente_fin=0.0, tetu=False):
+    return [sys.executable, "-c", FAUX_ARECORD, str(blocs), str(pause), message, str(attente_fin), "1" if tetu else "0"]
+
+
+def bloc_de_son(amplitude, decalage=200):
+    """0,1 s d'une note à cette amplitude, avec un décalage continu comme le vrai micro."""
+    import array
+    import math
+    return array.array("h", (decalage + int(amplitude * math.sin(2 * math.pi * 440 * i / 16000))
+                             for i in range(1600))).tobytes()
+
+
+VOIX = bloc_de_son(3000)  # volume vers 2 100 : de la voix
+CALME = bloc_de_son(50)  # volume vers 35 : une pièce calme
+
+
+class FauxMicro:
+    """Donne ses blocs, chacun 0,1 s après le précédent, puis se tait (None) jusqu'à fermer(), puis b""."""
+
+    def __init__(self, blocs, pas=0.0):
+        self.blocs = list(blocs)
+        self.pas = pas
+        self.lus = 0
+        self.instant = 1000.0
+        self.ferme = False
+
+    def instant_du_bloc(self, numero):
+        """L'instant d'arrivée du bloc numéro (à partir de 1)."""
+        return 1000.0 + 0.1 * numero
+
+    def lire(self, attente=0.5):
+        if self.blocs:
+            time.sleep(self.pas)
+            self.lus += 1
+            return self.blocs.pop(0), self.instant_du_bloc(self.lus)
+        if self.ferme:
+            return b"", None
+        time.sleep(min(attente, 0.02))
+        return None, None
+
+    def fermer(self):
+        self.ferme = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.fermer()
+
+
+class FauxVosk:
+    """Imite Vosk : un mot compris pour deux blocs de voix, et une phrase finie seulement après `fin` blocs calmes, car
+    Vosk attend plus longtemps qu'un court silence. Avec une grammaire, il ne trouve que le mot d'éveil, au bloc donné."""
+
+    def __init__(self, fin=8, eveil_au_bloc=None, fin_du_nom=None):
+        self.fin = fin
+        self.eveil_au_bloc = eveil_au_bloc
+        self.fin_du_nom = fin_du_nom
+        self.Reset()
+
+    def Reset(self):
+        self.mots, self.voix, self.calme, self.blocs = [], 0, 0, 0
+
+    def SetWords(self, _):
+        pass
+
+    def AcceptWaveform(self, bloc):
+        import micro as module_micro
+        self.blocs += 1
+        if self.eveil_au_bloc is not None:
+            return self.blocs == self.eveil_au_bloc
+        if module_micro.volume(bloc) > 300:
+            self.voix += 1
+            self.calme = 0
+            if self.voix % 2 == 0:
+                self.mots.append(f"mot{len(self.mots) + 1}")
+        else:
+            self.calme += 1
+        return bool(self.mots) and self.calme >= self.fin
+
+    def Result(self):
+        if self.eveil_au_bloc is not None:
+            return json.dumps({"text": "hé dolly", "result": [{"word": "hé", "end": self.fin_du_nom - 0.2},
+                                                              {"word": "dolly", "end": self.fin_du_nom}]})
+        texte = " ".join(self.mots)
+        self.mots, self.voix, self.calme = [], 0, 0
+        return json.dumps({"text": texte})
+
+    def PartialResult(self):
+        return json.dumps({"partial": " ".join(self.mots)})
+
+    def FinalResult(self):
+        if self.eveil_au_bloc is not None:
+            return json.dumps({"text": ""})
+        return self.Result()
+
+
+class Capture:
+    """Récupère ce qui est écrit dans le journal pendant un essai, tous fils confondus."""
+
+    def __enter__(self):
+        import io
+        self.avant, self.texte = sys.stdout, io.StringIO()
+        sys.stdout = self.texte
+        return self
+
+    def __exit__(self, *_):
+        sys.stdout = self.avant
+
+    def lignes(self):
+        return self.texte.getvalue().splitlines()
+
+
+def essai_micro():
+    titre("Micro lu par un fil à part")
+    import micro as module_micro
+    from micro import Micro, SuiviDeVoix
+
+    # Les blocs arrivent dans l'ordre, avec l'instant de leur arrivée, puis la fin du son.
+    with Micro(faux_arecord(5, 0.02)) as micro:
+        lus = []
+        while True:
+            bloc, instant = micro.lire(5)
+            if bloc == b"":
+                break
+            if bloc:
+                lus.append((bloc[0], len(bloc), instant))
+    verifier([numero for numero, _, _ in lus] == [0, 1, 2, 3, 4], f"les blocs arrivent dans l'ordre : {lus}")
+    verifier(all(taille == module_micro.TAILLE_BLOC for _, taille, _ in lus), "des blocs de 0,1 s")
+    verifier(all(a[2] <= b[2] for a, b in zip(lus, lus[1:])), "avec l'instant de leur arrivée")
+
+    # Vosk très en retard : la file reste bornée, le son le plus récent est gardé, et la perte est comptée.
+    micro = Micro(faux_arecord(10), file_max=3)
+    limite = time.monotonic() + 10
+    while not micro.fini and time.monotonic() < limite:
+        time.sleep(0.02)
+    with Capture() as capture:
+        micro.fermer()
+    restants = []
+    while True:
+        bloc, _ = micro.lire(0.1)
+        if not bloc:
+            break
+        restants.append(bloc[0])
+    verifier(restants == [7, 8, 9] and micro.perdus == 7, f"file bornée : {restants}, {micro.perdus} perdus")
+    verifier(any("file_max=3 perdus=7" in ligne for ligne in capture.lignes()), f"la perte est notée : {capture.lignes()}")
+
+    # Une coupure d'arecord est notée avec l'état de la file, dans un format que le résumé du journal comprend.
+    with Capture() as capture:
+        with Micro(faux_arecord(4, 0.05, "overrun!!! (at least 250.508 ms long)")) as micro:
+            while micro.lire(5)[0] != b"":
+                pass
+    coupures = [ligne for ligne in capture.lignes() if "overrun" in ligne]
+    verifier(len(coupures) == 1 and coupures[0].startswith("[micro] overrun!!!") and "file=" in coupures[0]
+             and "charge=" in coupures[0], f"coupure notée : {coupures}")
+    resume = resumer_journal.resumer([("A", 1, 1.0, ligne) for ligne in coupures])
+    verifier(resume["coupures"] == 1 and resume["coupure_max"] == 250.508 and resume["coupures_file_connue"] == 1,
+             f"le résumé la compte : {resume}")
+    verifier(micro.coupures == 1, "et le micro la compte aussi")
+    with Capture() as capture:
+        with Micro(faux_arecord(2, 0, "arecord: main:830: audio open error: Device or resource busy")) as micro:
+            while micro.lire(5)[0] != b"":
+                pass
+    verifier(any(ligne.startswith("[micro] arecord: main") for ligne in capture.lignes()), "les autres messages aussi")
+
+    # Un micro figé : lire() rend la main au lieu de bloquer, et fermer() l'arrête quand même, sans rester coincé.
+    micro = Micro(faux_arecord(2, attente_fin=30))
+    deux = [micro.lire(5)[0], micro.lire(5)[0]]
+    debut = time.monotonic()
+    rien = micro.lire(0.2)
+    verifier(all(deux) and rien == (None, None) and time.monotonic() - debut < 1, f"micro figé : lire rend la main ({rien})")
+    debut = time.monotonic()
+    micro.fermer()
+    verifier(time.monotonic() - debut < 3 and micro.processus.poll() is not None, "fermer arrête un micro figé")
+    verifier(micro.lire(0.1) == (b"", None), "puis lire annonce la fin du son")
+    micro = Micro(faux_arecord(1, attente_fin=30, tetu=True))
+    micro.lire(5)
+    debut = time.monotonic()
+    micro.fermer()
+    verifier(time.monotonic() - debut < 2 * module_micro.ARRET_MAX + 1 and micro.processus.poll() is not None,
+             f"même s'il ignore la demande d'arrêt : {time.monotonic() - debut:.1f} s")
+    micro.fermer()  # deux fois de suite : sans effet
+
+    # Le suivi du volume : la fin de la voix, et la fin de phrase au volume, seulement si on l'a demandée.
+    suivi = SuiviDeVoix(300)
+    for numero, bloc in enumerate([CALME] * 3 + [VOIX] * 4 + [CALME] * 10, 1):
+        suivi.ajouter(bloc, float(numero))
+    verifier(suivi.fin_de_voix == 7.0 and not suivi.phrase_finie(), f"fin de la voix au dernier bloc fort : {suivi.fin_de_voix}")
+    suivi = SuiviDeVoix(300, 0.5, 3)
+    etats = []
+    for bloc in [VOIX] * 2 + [CALME] * 6 + [VOIX] * 2 + [CALME] * 5:
+        suivi.ajouter(bloc, 0.0)
+        etats.append(suivi.phrase_finie())
+    verifier(etats.index(True) == 14, f"phrase finie après 0,5 s de calme, et 3 blocs de voix au moins : {etats}")
+    suivi = SuiviDeVoix(300, 0.5, 3)
+    for bloc in [CALME] * 30:
+        suivi.ajouter(bloc, 0.0)
+    verifier(not suivi.phrase_finie() and suivi.fin_de_voix is None, "le calme seul ne finit rien")
+    verifier(module_micro.commande_arecord("plughw:0,0")[:3] == ["arecord", "-D", "plughw:0,0"]
+             and not any("buffer" in a for a in module_micro.commande_arecord("plughw:0,0")), "arecord comme avant")
+    verifier(module_micro.commande_arecord("plughw:0,0", 2)[-1] == "--buffer-time=2000000", "tampon réglable")
+
+
+def essai_ecoute():
+    titre("Écoute : fin de la voix et fin de phrase au volume")
+    os.environ.setdefault("ANTHROPIC_API_KEY", "essai-sans-reseau")
+    import converser
+
+    def oreille_avec(blocs, silence_de_fin=None, guetteur=None, pas=0.0):
+        oreille = object.__new__(converser.Oreille)
+        oreille.reconnaisseur = FauxVosk()
+        oreille.guetteur = guetteur or FauxVosk()
+        oreille.duree_guettee = 0.0
+        oreille.silence_de_fin = silence_de_fin
+        oreille.fin_de_voix = None
+        oreille.micro = FauxMicro(blocs, pas)
+        oreille._ouvrir_micro = lambda: oreille.micro
+        return oreille
+
+    phrase = [CALME] * 3 + [VOIX] * 6 + [CALME] * 15
+    oreille = oreille_avec(phrase)
+    resultat = oreille.ecouter_jusqu_au_silence(5)
+    verifier(resultat == ("phrase", "mot1 mot2 mot3"), f"phrase entendue : {resultat}")
+    verifier(oreille.fin_de_voix == oreille.micro.instant_du_bloc(9), f"la voix finit au bloc 9 : {oreille.fin_de_voix}")
+    lus_avec_vosk = oreille.micro.lus
+    verifier(lus_avec_vosk == 17 and oreille.micro.ferme, f"sans réglage, Vosk conclut, 0,8 s après la voix : {lus_avec_vosk}")
+
+    oreille = oreille_avec(phrase, silence_de_fin=0.5)
+    resultat = oreille.ecouter_jusqu_au_silence(5)
+    verifier(resultat == ("phrase", "mot1 mot2 mot3") and oreille.micro.lus == 14,
+             f"au volume, la phrase finit 0,5 s après la voix, plus tôt : {resultat}, {oreille.micro.lus} blocs")
+    verifier(oreille.fin_de_voix == oreille.micro.instant_du_bloc(9), "même fin de la voix")
+
+    oreille = oreille_avec([CALME] * 30, silence_de_fin=0.5)
+    verifier(oreille.ecouter_jusqu_au_silence(0.3) == ("rien", "") and oreille.fin_de_voix is None, "le calme seul : rien")
+    oreille = oreille_avec([VOIX] * 4 + [CALME] * 3 + [VOIX] * 4 + [CALME] * 10, silence_de_fin=0.5)
+    resultat = oreille.ecouter_jusqu_au_silence(5)
+    verifier(resultat == ("phrase", "mot1 mot2 mot3 mot4") and oreille.micro.lus == 16,
+             f"une pause plus courte au milieu ne coupe pas la phrase : {resultat}, {oreille.micro.lus} blocs")
+
+    # Après « Hé Doly », seule la suite est transcrite, et la fin de la voix est celle de la suite.
+    reveils = []
+    debut = [CALME, VOIX, VOIX, VOIX, CALME]  # « Hé Doly », puis une pause
+    suite = [VOIX] * 5 + [CALME] * 12
+    oreille = oreille_avec(debut + suite, guetteur=FauxVosk(eveil_au_bloc=5, fin_du_nom=0.3))
+    resultat = oreille.guetter(60, lambda: reveils.append(1))
+    verifier(resultat == ("eveil", "mot1 mot2 mot3") and reveils == [1], f"éveil puis suite : {resultat}")
+    verifier(oreille.fin_de_voix == oreille.micro.instant_du_bloc(10), f"la voix finit au bloc 10 : {oreille.fin_de_voix}")
+    oreille = oreille_avec(debut + suite, silence_de_fin=0.5, guetteur=FauxVosk(eveil_au_bloc=5, fin_du_nom=0.3))
+    resultat = oreille.guetter(60, lambda: None)
+    verifier(resultat == ("eveil", "mot1 mot2 mot3") and oreille.micro.lus == 15,
+             f"au volume, la suite finit plus tôt : {resultat}, {oreille.micro.lus} blocs")
+
+    # Au toucher : la transcription finit ce qui reste dans la file avant de rendre le texte.
+    contact = {"fin": time.monotonic() + 0.5}
+    capteur_avant = converser.capteur_touche
+    converser.capteur_touche = lambda: time.monotonic() < contact["fin"]
+    try:
+        oreille = oreille_avec([VOIX] * 4 + [CALME] * 2, pas=0.02)
+        texte, duree, _ = oreille.ecouter_tant_que_touche()
+    finally:
+        converser.capteur_touche = capteur_avant
+    verifier(texte == "mot1 mot2" and abs(duree - 0.6) < 0.01, f"au toucher : {texte!r}, {duree:.2f} s")
+
+    # La mesure part de la vraie fin de la voix, sinon du texte compris, comme avant.
+    conversation = object.__new__(converser.Conversation)
+    conversation.oreille = oreille_avec([])
+    conversation.oreille.fin_de_voix = 123.0
+    verifier(conversation.fin_de_ta_voix() == (123.0, "la fin de ta voix"), "mesure depuis la fin de ta voix")
+    conversation.oreille.fin_de_voix = None
+    instant, origine = conversation.fin_de_ta_voix()
+    verifier(origine == "le texte compris" and abs(instant - time.monotonic()) < 1, "sinon depuis le texte compris")
+
+
+def essai_rapidite():
+    titre("Rapidité : préchauffage du cache, phrases prêtes, son d'attente")
+    os.environ.setdefault("ANTHROPIC_API_KEY", "essai-sans-reseau")
+    import anthropic
+    import converser
+    import sons_prets
+
+    class Objet:
+        def __init__(self, **champs):
+            self.__dict__.update(champs)
+
+    def reponse(contenu, arret="end_turn"):
+        return Objet(content=contenu, stop_reason=arret,
+                     usage=Objet(input_tokens=5, output_tokens=0, cache_read_input_tokens=0, cache_creation_input_tokens=4700))
+
+    class Flux:
+        def __init__(self, r):
+            self.r = r
+            self.text_stream = [b.text for b in r.content if b.type == "text"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def get_final_message(self):
+            return self.r
+
+    prechauffages, appels, reponses = [], [], []
+    reglage = {"delai": 0.0, "erreur": None}
+
+    def create(**demande):
+        prechauffages.append(dict(demande, debut=time.monotonic()))
+        time.sleep(reglage["delai"])
+        if reglage["erreur"]:
+            raise reglage["erreur"]
+        prechauffages[-1]["fin"] = time.monotonic()
+        return reponse([], "max_tokens")
+
+    def stream(**demande):
+        appels.append(dict(demande, debut=time.monotonic()))
+        return Flux(reponses.pop(0))
+
+    corps, voix = nouveau_corps()
+    capa = Capacites(corps, voix, Humeur(fichier=FICHIER_HUMEUR))
+    cerveau = converser.Cerveau("essai", capa)
+    cerveau.client = Objet(messages=Objet(stream=stream, create=create))
+
+    # Conversation neuve : seuls les outils et les consignes sont préparés.
+    with Capture() as capture:
+        verifier(cerveau.prechauffer(), "un préchauffage part dès son nom")
+        cerveau.prechauffage.join(5)
+    demande = prechauffages[-1]
+    verifier(demande["max_tokens"] == 0 and "stream" not in demande, "sans réponse demandée, et sans flux (refusé avec 0)")
+    verifier("cache_control" not in demande, "sans cache automatique, qui se placerait sur la phrase fictive")
+    verifier(demande["system"] is converser.SYSTEME_EN_CACHE and demande["system"][-1]["cache_control"] == {"type": "ephemeral"},
+             "un point de cache à la fin des consignes")
+    verifier(demande["tools"] is capacites.OUTILS and demande["output_config"] == {"effort": converser.EFFORT}
+             and demande["model"] == "essai" and "thinking" not in demande, "mêmes outils, effort et modèle que les vraies phrases")
+    verifier(demande["messages"] == [{"role": "user", "content": converser.PHRASE_DE_PRECHAUFFAGE}], f"rien d'autre : {demande['messages']}")
+    verifier(any("[cache] préchauffage : 0 lus et 4700 écrits" in ligne for ligne in capture.lignes()), f"noté : {capture.lignes()}")
+    with Capture() as capture:
+        verifier(not cerveau.prechauffer() and len(prechauffages) == 1, "pas deux fois tant que le cache est chaud")
+    verifier(capture.lignes() == ["[cache] encore chaud : pas de préchauffage"], f"et c'est noté : {capture.lignes()}")
+
+    # Une vraie phrase : mêmes consignes, outils, effort et modèle, avec en plus le cache automatique sur la conversation.
+    dites = []
+    reponses.append(reponse([Objet(type="text", text="Bonjour.")]))
+    with Capture():
+        cerveau.repondre("salut", dites.append, lambda: True)
+    vraie = appels[-1]
+    verifier(all(vraie[cle] == demande[cle] for cle in ("model", "system", "tools", "output_config")),
+             "la vraie phrase relit exactement le début préparé")
+    verifier(vraie["cache_control"] == {"type": "ephemeral"} and vraie["max_tokens"] == converser.MAX_TOKENS,
+             "et garde son cache automatique")
+    verifier(cerveau.attente_cache == 0.0, "rien à attendre : le préchauffage était fini")
+    verifier(cerveau.premier_outil is None and cerveau.appels == 1, "sans outil : un appel, pas de premier outil")
+
+    # Un geste avant toute parole : la mesure dit quand il a commencé, et combien d'appels à Claude il a fallu.
+    reponses.append(reponse([Objet(type="tool_use", id="1", name="minuteur", input={"action": "consulter", "secondes": 0})],
+                            "tool_use"))
+    reponses.append(reponse([Objet(type="text", text="Voilà.")]))
+    with Capture():
+        cerveau.repondre("il reste combien", dites.append, lambda: True)
+    verifier(cerveau.premier_outil is not None and 0 <= cerveau.premier_outil < 1 and cerveau.appels == 2,
+             f"premier outil {cerveau.premier_outil}, {cerveau.appels} appels")
+
+    # Plus tard, cache froid : la conversation déjà connue est préparée, sans la nouvelle phrase, et sans la modifier.
+    cerveau.dernier_envoi = time.monotonic() - converser.CACHE_CHAUD - 1
+    reglage["delai"] = 0.3
+    reponses.append(reponse([Objet(type="text", text="Oui.")]))
+    with Capture():
+        verifier(cerveau.prechauffer(), "cache refroidi : nouveau préchauffage")
+        cerveau.repondre("ma phrase secrète", dites.append, lambda: True)
+    demande = prechauffages[-1]
+    roles = [m["role"] for m in demande["messages"]]
+    verifier(roles == ["user", "system", "assistant", "user", "system", "assistant", "user", "assistant", "user"],
+             f"l'historique, puis la phrase fictive : {roles}")
+    verifier(demande["messages"][6]["content"][-1].get("cache_control") == {"type": "ephemeral"},
+             f"un point de cache sur le dernier message de l'utilisateur, ici le résultat de l'outil : {demande['messages'][6]}")
+    verifier(demande["messages"][0] is cerveau.messages[0] and demande["messages"][3] is cerveau.messages[3],
+             "les messages plus anciens sont renvoyés tels quels")
+    verifier("secrète" not in json.dumps(demande["messages"], default=str), "la nouvelle phrase n'est jamais envoyée en avance")
+    verifier("cache_control" not in cerveau.messages[6]["content"][-1], "l'historique n'est pas modifié")
+    verifier(demande["messages"][2]["content"] is cerveau.messages[2]["content"], "la réponse de Claude est renvoyée telle quelle")
+    verifier(0.1 < cerveau.attente_cache < converser.ATTENTE_PRECHAUFFAGE and appels[-1]["debut"] >= demande["fin"],
+             f"la phrase attend le préchauffage en cours : {cerveau.attente_cache:.2f} s")
+
+    # Un préchauffage trop lent n'est attendu qu'un moment.
+    cerveau.dernier_envoi = None
+    reglage["delai"] = 1.0
+    attente_avant = converser.ATTENTE_PRECHAUFFAGE
+    converser.ATTENTE_PRECHAUFFAGE = 0.2
+    reponses.append(reponse([Objet(type="text", text="Oui.")]))
+    with Capture():
+        cerveau.prechauffer()
+        cerveau.repondre("encore", dites.append, lambda: True)
+        cerveau.prechauffage.join(5)
+    converser.ATTENTE_PRECHAUFFAGE = attente_avant
+    verifier(0.15 < cerveau.attente_cache < 0.6, f"attente bornée : {cerveau.attente_cache:.2f} s")
+    reglage["delai"] = 0.0
+
+    # Après un outil, la dernière phrase connue est le résultat de l'outil : c'est lui qui reçoit le point de cache.
+    resultat_outil = {"type": "tool_result", "tool_use_id": "1", "content": "ok", "is_error": False}
+    historique = [{"role": "user", "content": "lève les bras"}, {"role": "system", "content": "Informations du robot"},
+                  {"role": "assistant", "content": [Objet(type="tool_use")]}, {"role": "user", "content": [resultat_outil]}]
+    messages = converser.messages_de_prechauffage(historique)
+    verifier(messages[3]["content"][0]["cache_control"] == {"type": "ephemeral"} and "cache_control" not in resultat_outil
+             and messages[0] is historique[0], "point de cache sur le résultat d'outil, recopié")
+    verifier(messages[-1] == {"role": "user", "content": converser.PHRASE_DE_PRECHAUFFAGE}, "puis la phrase fictive")
+
+    # La conversation va repartir à zéro : seul le début fixe est préparé.
+    cerveau.dernier_envoi = None
+    cerveau.echanges = converser.MAX_ECHANGES
+    with Capture():
+        cerveau.prechauffer()
+        cerveau.prechauffage.join(5)
+    verifier(len(prechauffages[-1]["messages"]) == 1, "avant une conversation neuve, seul le début fixe")
+    cerveau.echanges = 1
+
+    # Les erreurs ne gênent jamais la conversation. Un refus arrête les préchauffages jusqu'au prochain lancement.
+    erreur = anthropic.APIConnectionError.__new__(anthropic.APIConnectionError)
+    reglage["erreur"] = erreur
+    cerveau.dernier_envoi = None
+    with Capture() as capture:
+        cerveau.prechauffer()
+        cerveau.prechauffage.join(5)
+    verifier(any("préchauffage raté : APIConnectionError" in ligne for ligne in capture.lignes()), f"{capture.lignes()}")
+    verifier(cerveau.prechauffage_actif and cerveau.dernier_envoi is None, "une coupure : on réessaiera au prochain réveil")
+    refus = anthropic.BadRequestError.__new__(anthropic.BadRequestError)
+    refus.status_code = 400
+    reglage["erreur"] = refus
+    with Capture() as capture:
+        cerveau.prechauffer()
+        cerveau.prechauffage.join(5)
+        verifier(not cerveau.prechauffer(), "un refus arrête les préchauffages")
+    verifier(any("préchauffage refusé (erreur 400)" in ligne for ligne in capture.lignes()), f"{capture.lignes()}")
+    reglage["erreur"] = ValueError("surprise")
+    cerveau.prechauffage_actif = True
+    with Capture() as capture:
+        cerveau.prechauffer()
+        cerveau.prechauffage.join(5)
+    verifier(not cerveau.prechauffage_actif and any("inattendue : ValueError" in l for l in capture.lignes()), "une surprise aussi")
+    reglage["erreur"] = None
+
+    # Les phrases fixes : calculées une fois, gardées sur le disque, refaites si la voix ou le texte changent.
+    dossier = os.path.join(DOSSIER_ESSAI, "phrases")
+    ram = os.path.join(DOSSIER_ESSAI, "ram")
+    os.makedirs(ram, exist_ok=True)
+    calculs = []
+
+    def calculer(phrase):
+        calculs.append(phrase)
+        chemin = os.path.join(ram, f"{len(calculs)}.wav")
+        sons_prets.creer_son_d_attente(chemin)  # n'importe quel vrai WAV
+        return chemin
+
+    with Capture():
+        pretes = sons_prets.PhrasesPretes(["Je t'écoute !", "Je n'ai rien compris."], "voix 1", dossier)
+    verifier(pretes.manquantes() == ["Je t'écoute !", "Je n'ai rien compris."] and pretes.chemin("Je t'écoute !") is None,
+             "au premier lancement, rien n'est prêt")
+    verifier(pretes.garder("Je t'écoute !", calculer("Je t'écoute !")), "une phrase fixe calculée est gardée")
+    chemin = pretes.chemin("Je t'écoute !")
+    verifier(chemin and pretes.contient(chemin) and not pretes.contient(os.path.join(ram, "1.wav")), f"sur le disque : {chemin}")
+    verifier(not pretes.garder("Une phrase de Claude.", calculer("x")), "une autre phrase n'est jamais gardée")
+    verifier(pretes.manquantes() == ["Je n'ai rien compris."], "rien n'est préparé d'avance : Vosk garde le processeur")
+    verifier(pretes.garder("Je n'ai rien compris.", calculer("Je n'ai rien compris.")) and not pretes.manquantes(),
+             "la seconde est gardée à son premier usage")
+    verifier(not pretes.garder("Je n'ai rien compris.", calculer("Je n'ai rien compris.")), "une seule fois")
+    verifier(sorted(os.listdir(dossier)) == sorted(pretes.noms.values()), f"rien d'autre dans le dossier : {os.listdir(dossier)}")
+    nombre = len(calculs)
+    with Capture():
+        pretes = sons_prets.PhrasesPretes(["Je t'écoute !", "Je n'ai rien compris."], "voix 1", dossier)
+    verifier(not pretes.manquantes() and len(calculs) == nombre, "au lancement suivant, tout est prêt sans calcul")
+    with open(pretes.chemin("Je n'ai rien compris."), "wb") as f:
+        f.write(b"abime")
+    with Capture():
+        pretes = sons_prets.PhrasesPretes(["Je t'écoute !", "Je n'ai rien compris."], "voix 1", dossier)
+    verifier(pretes.manquantes() == ["Je n'ai rien compris."], "un son abîmé est refait")
+    with Capture():
+        pretes = sons_prets.PhrasesPretes(["Je t'écoute ! Bonjour."], "voix 2", dossier)
+    verifier(pretes.manquantes() == ["Je t'écoute ! Bonjour."] and os.listdir(dossier) == [],
+             f"autre voix ou autre texte : tout est refait, les anciens sons retirés : {os.listdir(dossier)}")
+    verifier(not pretes.garder("Je t'écoute ! Bonjour.", "") and pretes.manquantes() == ["Je t'écoute ! Bonjour."],
+             "un calcul raté de Piper n'est pas gardé")
+    empreinte = sons_prets.empreinte_de_la_voix([chemin, "/inexistant"])
+    verifier("absent" in empreinte and sons_prets.empreinte_de_la_voix([chemin, "/inexistant"]) == empreinte, "empreinte stable")
+
+    voix_reelle = object.__new__(converser.Voix)
+    with Capture():
+        voix_reelle.pretes = sons_prets.PhrasesPretes([converser.RIEN_COMPRIS], "voix 3", dossier)
+    voix_reelle.calculer = calculer
+    nombre = len(calculs)
+    premier = voix_reelle._son_de(converser.RIEN_COMPRIS)
+    second = voix_reelle._son_de(converser.RIEN_COMPRIS)
+    libre = voix_reelle._son_de("Il fait beau.")
+    verifier(len(calculs) == nombre + 2 and voix_reelle.pretes.contient(second) and not voix_reelle.pretes.contient(premier)
+             and not voix_reelle.pretes.contient(libre), "la voix ne recalcule plus une phrase fixe")
+    verifier(converser.RIEN_COMPRIS in converser.PHRASES_FIXES and converser.ACCUEIL_MAINS_LIBRES in converser.PHRASES_FIXES,
+             "ses phrases fixes sont dans la liste")
+
+    # Le son d'attente : court et doux, sans clic.
+    import wave
+    attente = os.path.join(DOSSIER_ESSAI, "attente.wav")
+    sons_prets.creer_son_d_attente(attente)
+    with wave.open(attente) as w:
+        duree = w.getnframes() / w.getframerate()
+        import array
+        echantillons = array.array("h", w.readframes(w.getnframes()))
+    verifier(duree <= 0.3 and 4000 <= max(map(abs, echantillons)) < 8000 and abs(echantillons[0]) < 200
+             and abs(echantillons[-1]) < 200, f"son d'attente : {duree:.2f} s, au plus {max(map(abs, echantillons))}")
+
+    # Il ne passe que si Claude tarde, une fois, et la mesure le dit. Elle part de la fin de ta voix.
+    class FauxCerveau:
+        def __init__(self, lenteur):
+            self.lenteur = lenteur
+            self.premier_mot = None
+            self.attente_cache = 0.0
+
+        def repondre(self, texte, dire, actif):
+            time.sleep(self.lenteur)
+            self.premier_mot = self.lenteur
+            dire("Réponse.")
+
+        def prechauffer(self):
+            pass
+
+    attente_avant = converser.ATTENTE_AVANT_SON
+    converser.ATTENTE_AVANT_SON = 0.1
+    try:
+        for lenteur, actif, attendu in ((0.4, True, 1), (0.0, True, 0), (0.4, False, 0)):
+            corps.fermer()
+            corps, voix = nouveau_corps()
+            conversation = converser.Conversation(voix, None, FauxCerveau(lenteur), corps, capa, discret=True)
+            conversation.son_d_attente_actif = actif
+            with Capture() as capture:
+                conversation.repondre("bonjour", time.monotonic() - 1.0, "la fin de ta voix")
+            mesures = [l for l in capture.lignes() if l.startswith("[mesure]")]
+            verifier(voix.sons.count(voix.son_d_attente) == attendu and voix.phrases == ["Réponse."],
+                     f"Claude en {lenteur} s, son d'attente {'permis' if actif else 'coupé'} : {voix.sons}")
+            verifier(len(mesures) == 1 and ("son d'attente" in mesures[0]) == bool(attendu)
+                     and "depuis la fin de ta voix" in mesures[0], f"mesure : {mesures}")
+            resume = resumer_journal.resumer([("A", 1, 1.0, mesures[0])])
+            delai = resume["delais"].get("la fin de ta voix", [0])[0]
+            verifier(1.0 <= delai < 2.5 and resume["phrases"] == 1, f"le résumé lit ce délai : {resume['delais']}")
+
+        # Claude commence par un geste, sans rien dire : le petit son comble le silence, et la mesure montre le geste.
+        class FauxCerveauGeste(FauxCerveau):
+            def repondre(self, texte, dire, actif):
+                self.premier_outil, self.appels = 0.05, 3
+                time.sleep(self.lenteur)  # le déplacement
+                dire("Voilà.")
+
+        corps.fermer()
+        corps, voix = nouveau_corps()
+        conversation = converser.Conversation(voix, None, FauxCerveauGeste(0.4), corps, capa, discret=True)
+        with Capture() as capture:
+            conversation.repondre("avance puis tourne", time.monotonic() - 1.0, "la fin de ta voix")
+        mesures = [l for l in capture.lignes() if l.startswith("[mesure]")]
+        verifier(voix.sons.count(voix.son_d_attente) == 1, f"un geste sans parole : le petit son passe une fois : {voix.sons}")
+        verifier(len(mesures) == 1 and "premier outil 0.05 s, 3 appels à Claude" in mesures[0], f"mesure : {mesures}")
+        resume = resumer_journal.resumer([("A", 1, 1.0, mesures[0])])
+        verifier(resume["delais_avec_outil"] and resume["appels_max"] == 3 and not resume["delais_sans_outil"],
+                 f"le résumé range ce délai avec les outils : {resume['delais_avec_outil']}")
+    finally:
+        converser.ATTENTE_AVANT_SON = attente_avant
+    corps.fermer()
+
+    # Le résumé du journal : délais par origine, premier mot de Claude, préchauffages.
+    entrees = [("A", 1, 1.0, "[info] Prêt.")]
+    for numero, delai in enumerate((2.0, 2.5, 3.0, 3.5, 6.0)):
+        entrees.append(("A", 1, 10.0 + numero, f"[mesure] fin de ta phrase puis premier son : {delai:.2f} s (fin de phrase et "
+                                               f"transcription 0.90 s, premier mot de Claude 1.20 s, depuis la fin de ta voix)"))
+    entrees += [
+        ("A", 1, 20.0, "[mesure] fin de ta phrase puis premier son : 1.80 s (transcription 0.10 s, attente du cache 0.30 s, "
+                       "premier mot de Claude 1.00 s, depuis le doigt levé, son d'attente)"),
+        ("A", 1, 21.0, "[mesure] fin de ta phrase puis premier son : 2.00 s (transcription 0.10 s, premier mot de Claude 1.00 s)"),
+        ("A", 1, 22.0, "[cache] préchauffage : 0 lus et 4700 écrits en cache, 5 envoyés, 0.80 s"),
+        ("A", 1, 23.0, "[cache] encore chaud : pas de préchauffage"),
+        ("A", 1, 24.0, "[cache] préchauffage raté : APIConnectionError"),
+        ("A", 1, 25.0, "[micro] overrun!!! (at least 300.000 ms long) file=0 file_max=1 perdus=0 ouvert=3.0s charge=1.00 dispo=200Mo echange=90Mo"),
+        ("A", 1, 26.0, "[micro] file_max=12 perdus=0 ouvert=40s"),
+        # Un relevé après la chauffe de 30 minutes, comme sur un long lancement.
+        ("A", 1, 27.0,"[sante] appli=300Mo piper=90Mo dispo=320Mo echange=17Mo temp=50.0C charge=1.20 appli_depuis=1900s "
+                       "robot_depuis=2000s"),
+        ("A", 1, 28.0, "[mesure] fin de ta phrase puis premier son : 15.00 s (fin de phrase et transcription 0.90 s, premier "
+                       "mot de Claude 1.10 s, premier outil 1.30 s, 4 appels à Claude, depuis le texte compris)"),
+    ]
+    texte = resumer_journal.en_francais(resumer_journal.resumer(entrees))
+    verifier("Phrases auxquelles il a répondu : 8." in texte, texte)
+    verifier("Délai de réponse quand Claude lance un geste ou un outil : médiane 15.00 s, au plus 15.00 s (1 phrase), "
+             "premier outil lancé en médiane 1.30 s après l'envoi, jusqu'à 4 appels à Claude pour une phrase." in texte, texte)
+    verifier("Délai de réponse sans geste ni outil : médiane 2.75 s, 90 % sous 6.00 s, au plus 6.00 s (6 phrases)." in texte, texte)
+    verifier("Au moment des coupures : échange de 90 à 90 Mo (de 17 à 17 Mo sur les relevés de santé), mémoire disponible "
+             "200 Mo au plus bas, charge 1.00 au plus." in texte, texte)
+    verifier("Délai de réponse, depuis la fin de ta voix : médiane 3.00 s, 90 % sous 6.00 s, au plus 6.00 s (5 phrases)." in texte, texte)
+    verifier("Délai de réponse, depuis le doigt levé : médiane 1.80 s, au plus 1.80 s (1 phrase)." in texte, texte)
+    verifier("Premier mot de Claude : médiane 1.20 s" in texte and "(8 phrases)" in texte, texte)
+    verifier("Petit son d'attente : 1 fois." in texte, texte)
+    verifier("Préchauffage du cache : 1 fois, 1 raté(s), 1 fois inutile" in texte, texte)
+    verifier("presque vide 1 fois sur 1" in texte and "jusqu'à 12 blocs en attente (1.2 s de son), 0 bloc(s) perdu(s)" in texte, texte)
+    ancien = resumer_journal.en_francais(resumer_journal.resumer(entrees[:1] + entrees[7:8]))
+    verifier("Délai de réponse" not in ancien, "une mesure d'avant l'étape 2 ne compte pas dans les délais")
+
+
+def essai_comprehension():
+    titre("Test de compréhension : calcul du score")
+    import tester_comprehension as tc
+
+    verifier(tc.mots("Hé Doly, quelle heure est-il ?") == ["hé", "dolly", "quelle", "heure", "est", "il"], tc.mots("Hé Doly, quelle heure est-il ?"))
+    verifier(tc.mots("Je suis triste aujourd’hui.") == tc.mots("je suis triste aujourd'hui"), "apostrophes et ponctuation")
+    verifier(tc.sans_eveil("Hé Doly, quelle heure est-il ?") == "quelle heure est-il ?", "sans le mot d'éveil")
+    verifier(tc.mots_retrouves("quelle heure est-il", "quelle heure est il") == 4, "tout est compris")
+    verifier(tc.mots_retrouves("quelle heure est-il", "et quelle leur est il") == 3, "un mot confondu, un mot en trop")
+    verifier(tc.mots_retrouves("mets un minuteur de cinq minutes", "") == 0, "rien compris")
+    essais = [tc.noter({"situation": "1m", "phrase": "Hé Doly, prends une photo.", "entendu": "prends une photo", "eveil": True}),
+              tc.noter({"situation": "1m", "phrase": "Hé Doly, lève les bras.", "entendu": "lève le bras", "eveil": True}),
+              tc.noter({"situation": "tele", "phrase": "Hé Doly, lève les bras.", "entendu": "", "eveil": False})]
+    verifier([e["compris"] for e in essais] == [3, 2, 0] and [e["mots"] for e in essais] == [3, 3, 3], f"{essais}")
+    texte = tc.bilan(essais)
+    verifier("À un mètre : 83 % des mots compris (5 sur 6), 1 phrase(s) entièrement comprise(s) sur 2, « Hé Doly » "
+             "reconnu 2 fois sur 2." in texte and "Télé allumée : 0 %" in texte and "En tout : 56 %" in texte, texte)
+    verifier(tc.bilan([]) == "Aucun essai.", "sans essai")
+    verifier("Calcul de Vosk" not in texte, "sans mesure de temps, pas de ligne sur Vosk")
+    chronometres = [dict(e, calcul=1.0, duree_son=2.5) for e in essais]
+    verifier("Calcul de Vosk : 3.0 s pour 7.5 s de son, soit 0.40 fois la durée du son." in tc.bilan(chronometres),
+             tc.bilan(chronometres))
+
+    # L'enregistrement s'arrête après un court silence qui suit la voix, ou au bout de la durée maximale.
+    blocs, voix = tc.enregistrer(FauxMicro([CALME] * 2 + [VOIX] * 5 + [CALME] * 30).lire, 300)
+    verifier(len(blocs) == 2 + 5 + 12 and voix, f"fin après 1,2 s de calme : {len(blocs)} blocs")
+    blocs, voix = tc.enregistrer(FauxMicro([CALME] * 100).lire, 300, duree_max=1)
+    verifier(len(blocs) == 10 and not voix, "sans voix, la durée maximale")
+    blocs, voix = tc.enregistrer(FauxMicro([VOIX] * 3).lire, 300, duree_max=1,
+                                 horloge=iter([i * 0.5 for i in range(100)]).__next__)
+    verifier(len(blocs) == 3, "un micro qui se tait n'est pas attendu sans fin")
+    verifier(tc.niveau_ambiant([CALME] * 9 + [VOIX]) < 100, "le bruit de la pièce ignore un son bref")
+
+    # La transcription suit le chemin de l'appli : le mot d'éveil, puis seulement la suite.
+    def creer(grammaire):
+        return FauxVosk(eveil_au_bloc=5, fin_du_nom=0.3) if grammaire else FauxVosk(fin=3)
+
+    son = [CALME, VOIX, VOIX, VOIX, CALME] + [VOIX] * 4 + [CALME] * 5
+    verifier(tc.transcrire(son, creer, "hé dolly") == (True, "mot1 mot2"), f"éveil puis suite : {tc.transcrire(son, creer, 'hé dolly')}")
+    sans_eveil = tc.transcrire(son, lambda g: FauxVosk(eveil_au_bloc=99, fin_du_nom=0.3) if g else FauxVosk(fin=3), "hé dolly")
+    verifier(sans_eveil == (False, "mot1 mot2 mot3"), f"sans éveil reconnu, tout le son est transcrit : {sans_eveil}")
+
+    chemin = os.path.join(DOSSIER_ESSAI, "essai.wav")
+    tc.ecrire_wav(chemin, [VOIX, CALME])
+    verifier(tc.lire_wav(chemin) == [VOIX, CALME], "les sons se relisent à l'identique")
+    tc.enregistrer_essais(DOSSIER_ESSAI, essais)
+    with open(os.path.join(DOSSIER_ESSAI, tc.FICHIER_ESSAIS), encoding="utf-8") as f:
+        verifier(json.load(f) == essais, "les essais sont gardés")
+    verifier(sorted(tc.SITUATIONS) == ["1m", "3m", "autre", "tele"] and len(tc.PHRASES) == 10, "4 situations, 10 phrases")
+    verifier(all(p.startswith("Hé Doly, ") for p in tc.PHRASES), "chaque phrase commence par son nom")
+
+
 def main():
     global DOSSIER_IMAGES
     analyse = argparse.ArgumentParser(description="Essais sans matériel.")
@@ -1767,6 +2449,7 @@ def main():
         "ecran": essai_ecran, "reactions": essai_reactions, "capacites": essai_capacites, "jeux": essai_jeux,
         "toucher": essai_toucher, "cerveau": essai_cerveau, "conversation": essai_conversation, "garde": essai_garde,
         "sante": essai_sante, "base": essai_base,
+        "micro": essai_micro, "ecoute": essai_ecoute, "rapidite": essai_rapidite, "comprehension": essai_comprehension,
     }
     for nom, essai in tous.items():
         if options.essais and nom not in options.essais:

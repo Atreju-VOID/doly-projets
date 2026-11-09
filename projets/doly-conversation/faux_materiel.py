@@ -240,6 +240,7 @@ class FausseVoix:
         self.fin = 0.0
         self.generation = 0
         self.premier_son = None
+        self.son_d_attente = "attente.wav"  # le petit son joué quand Claude tarde
 
     def _occuper(self, duree):
         self.fin = max(self.fin, time.monotonic()) + duree

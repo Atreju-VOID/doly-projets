@@ -96,6 +96,71 @@ sudo systemctl start doly-francais
 
 **Le bilan :** `python3 resumer_journal.py`. « Sur la dernière heure » n'apparaît qu'après une heure et demie d'écoute. Le chiffre reste normal s'il a monté pendant une conversation : c'est un chiffre qui monte encore au repos qui serait inquiétant.
 
+## Écoute et rapidité
+
+Ce qui a changé est expliqué dans le [README](README.md#écoute-et-rapidité). Compte environ 1 h 30, dont 30 minutes pour le test de compréhension. Tout se fait avec l'appli arrêtée (`sudo systemctl stop doly-francais`), depuis le dossier du code.
+
+**1. Les essais sans matériel**, 2 minutes, sans bruit ni mouvement :
+
+```bash
+~/doly-env/bin/python essais_sans_materiel.py micro ecoute rapidite comprehension
+~/doly-env/bin/python essais_sans_materiel.py
+```
+
+La première ligne essaie seulement ce qui a changé, la seconde tout. Les deux doivent finir par « 0 échecs ». Les essais `micro`, `ecoute`, `rapidite` et `comprehension` passent aussi sur un PC, avec des imitations de Vosk, d'anthropic et d'audioop : `py essais_sur_pc.py` sous Windows.
+
+**2. Ses phrases fixes.** Lance l'appli à la main, en mains libres, et regarde les premières lignes :
+
+```bash
+~/doly-env/bin/python converser.py --mains-libres
+```
+
+- Au tout premier lancement : `[voix] phrases fixes : 0 prêtes sur le disque, 16 gardées la première fois qu'il les dira`.
+- Arrête (Ctrl+C) et relance : `1 prêtes sur le disque`, celle de « Je t'écoute ! », qui doit venir un peu plus vite. Les autres s'ajoutent quand il les dit.
+- `[info] Écoute : fin au volume non, préchauffage oui, son d'attente oui` rappelle les réglages.
+
+**3. Le préchauffage du cache.** L'appli tourne. Ne lui parle pas pendant 5 minutes, puis dis « Hé Doly, quelle heure est-il ? ». Dans l'écran, tu dois voir, dans cet ordre :
+
+- `[cache] préchauffage : 0 lus et 4700 écrits en cache` environ, puis la ligne `[claude]` de ta phrase, avec **environ 4 700 lus en cache**. Si elle dit 0 lus, le préchauffage ne sert à rien : note-le.
+- Redis tout de suite « Hé Doly, et quelle date ? » : `[cache] encore chaud : pas de préchauffage`.
+- Le `premier mot de Claude` de la ligne `[mesure]`, juste après 5 minutes de silence : à comparer avec le même essai lancé avec `--sans-prechauffage`. Fais-en 3 de chaque, car un seul essai varie beaucoup.
+
+**4. La mesure juste.** Dis une dizaine de phrases après « Hé Doly ». Les lignes `[mesure]` finissent maintenant par `depuis la fin de ta voix`, et `fin de phrase et transcription` vaut environ 1 s : c'est la seconde qu'oubliait l'ancienne mesure. Au toucher, elles finissent par `depuis le doigt levé`.
+
+**5. Le petit son d'attente.** Demande « Hé Doly, quel temps fera-t-il demain à Lyon ? », qui passe par un outil et prend souvent plus de temps. Si Claude n'a rien dit au bout de 2,5 s, tu entends deux notes aiguës et brèves, une seule fois, et la réponse doit suivre sans être coupée ni retardée. La ligne `[mesure]` finit alors par `son d'attente`. S'il gêne : `--sans-son-d-attente`, ou `ATTENTE_AVANT_SON` en haut de `converser.py`.
+
+Puis, **au sol, avec un mètre de libre autour de lui**, demande « Hé Doly, avance un peu, tourne, puis recule ». C'est le cas où le premier son arrivait jusqu'à 15 s plus tard. La ligne `[mesure]` donne maintenant `premier outil … s, N appels à Claude` : un premier outil lancé vite mais beaucoup d'appels montrent que l'attente vient des allers-retours avec Claude, un geste après l'autre. Note aussi s'il a dit quelque chose avant de bouger, et si le petit son est passé.
+
+**6. La fin de phrase au volume**, encore en essai :
+
+```bash
+~/doly-env/bin/python converser.py --mains-libres --fin-au-volume
+```
+
+Parle naturellement, avec des hésitations : « Hé Doly, mets un minuteur de... cinq minutes », « Hé Doly, raconte-moi... non, dis-moi l'heure ». Il ne doit jamais te couper au milieu d'une phrase. Compare le délai des lignes `[mesure]` à celui de l'étape 4. S'il coupe, essaie `--fin-au-volume 1.0`. Si une valeur ne coupe jamais, elle pourra devenir le réglage par défaut (`FIN_AU_VOLUME` en haut de `converser.py`).
+
+**7. Le micro sans perte.** Reprends le test long de l'étape 1 : l'appli installée, une conversation d'une heure avec des scènes, puis du repos. Ensuite :
+
+```bash
+python3 resumer_journal.py --depuis "3 hours ago"
+```
+
+- `Coupures du micro : aucune` : la cause était bien Vosk, lu sur le même fil que le micro.
+- Des coupures, avec `la file du micro était presque vide` à chaque fois : Vosk suivait, la cause est ailleurs, sans doute le processeur ou la mémoire. La ligne `Au moment des coupures` du résumé donne l'échange, la mémoire disponible et la charge : un échange bien plus haut qu'au repos, comme les 128 Mo du test de l'étape 1 contre 17 Mo au début, désigne le manque de mémoire. Prochaine piste : `TAMPON_MICRO = 2` en haut de `converser.py`, pour que la carte son garde 2 s de son, puis refaire ce test.
+- `File du micro : jusqu'à N blocs en attente` : au-dessus de 100, du son est perdu, et le résumé le dit.
+
+Le test du micro figé, dans « La solidité », doit toujours donner la même relance.
+
+**8. Le test de compréhension**, environ 30 minutes, avec une deuxième personne pour la dernière situation et une télé :
+
+```bash
+~/doly-env/bin/python tester_comprehension.py
+```
+
+Doly dit une phrase, tu la répètes après le bip, normalement, comme si tu lui parlais. Il y a 10 phrases par situation. Avant chaque situation, Entrée la commence, `p` la passe et `q` arrête tout. Pour 3 m, il te laisse 10 secondes pour t'éloigner. Le score s'affiche après chaque phrase et chaque situation, puis à la fin. Tout reste dans `~/doly-comprehension/<date et heure>/` : un son par phrase, `essais.json` et `bilan.txt`. Pour une seule situation : `tester_comprehension.py tele`. Pour refaire les calculs plus tard sur les mêmes sons, par exemple avec un autre modèle : `tester_comprehension.py --relire ~/doly-comprehension/<date et heure>`.
+
+**Ce qu'il faut rapporter :** les lignes `Délai de réponse` et `Premier mot de Claude` du résumé, avec et sans préchauffage, les lignes `Coupures du micro` et `Au moment des coupures`, si la fin au volume a coupé quelqu'un, et le bilan du test de compréhension.
+
 ## Après le test
 
 Pour relancer l'appli installée :

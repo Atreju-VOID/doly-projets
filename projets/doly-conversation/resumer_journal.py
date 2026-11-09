@@ -2,8 +2,8 @@
 """
 resumer_journal.py
 
-Résume le journal de l'appli en français simple : durée d'écoute la plus longue, mémoire, coupures du micro, erreurs et
-redémarrages. Il ne fait que lire le journal, sans toucher au matériel, et n'affiche aucune phrase dite.
+Résume le journal de l'appli en français simple : durée d'écoute la plus longue, mémoire, coupures du micro, erreurs,
+redémarrages et délais de réponse. Il ne fait que lire le journal, sans toucher au matériel, et n'affiche aucune phrase dite.
 
 Les durées viennent de l'horloge interne de chaque démarrage (__MONOTONIC_TIMESTAMP), car l'heure du robot est fausse
 pendant les premières secondes après l'allumage.
@@ -17,14 +17,25 @@ Usage, sur le robot :
 
 import argparse
 import json
+import math
 import re
+import statistics
 import subprocess
 import sys
 
 COUPURE_LONGUE = 200  # ms
 CHAUFFE = 1800  # secondes
+FILE_PRESQUE_VIDE = 2  # blocs : à une coupure, une file aussi courte montre que Vosk suivait
 
 MOTIF_COUPURE = re.compile(r"overrun.*?at least ([\d.]+) ms")
+MOTIF_FILE_A_LA_COUPURE = re.compile(r"\bfile=(\d+)")
+MOTIF_FILE = re.compile(r"\[micro\] file_max=(\d+) perdus=(\d+)")
+MOTIF_MESURE = re.compile(r"\[mesure\] fin de ta phrase puis premier son : ([\d.]+) s \((.*)\)")
+MOTIF_PREMIER_MOT = re.compile(r"premier mot de Claude ([\d.]+) s")
+MOTIF_ORIGINE = re.compile(r"depuis (la fin de ta voix|le doigt levé|le texte compris)")
+MOTIF_OUTIL = re.compile(r"premier outil ([\d.]+) s, (\d+) appels")
+MOTIF_ETAT_A_LA_COUPURE = re.compile(r"charge=([\d.]+) dispo=(\d+)Mo echange=(\d+)Mo")
+MOTIF_PRECHAUFFAGE = re.compile(r"\[cache\] préchauffage : (\d+) lus et (\d+) écrits")
 MOTIF_SANTE = re.compile(r"\[sante\] (.*)")
 MOTIF_CHAMP = re.compile(r"(\w+)=(\?|[\d.]+)")
 MOTIF_ERREUR = re.compile(r"\[erreur\] (.*)")
@@ -56,6 +67,22 @@ def nouveau_resume():
         "minutes_sur_base": 0,
         "minutes_hors_base": 0,
         "batterie_min": None,
+        # Écoute et rapidité.
+        "delais": {},  # d'où part la mesure -> délais entre la fin de ta phrase et le premier son, en s
+        "delais_avec_outil": [],  # s, mesurés depuis l'étape 2, quand Claude a lancé un geste ou un outil
+        "delais_sans_outil": [],
+        "premiers_outils": [],  # s après l'envoi à Claude
+        "appels_max": 0,  # appels à Claude pour une même phrase
+        "etats_a_la_coupure": [],  # (charge, mémoire disponible en Mo, échange en Mo) au moment d'une coupure
+        "premiers_mots": [],  # s
+        "sons_d_attente": 0,
+        "coupures_file_connue": 0,  # coupures notées avec l'état de la file
+        "coupures_file_vide": 0,
+        "file_max": None,  # blocs
+        "blocs_perdus": 0,
+        "prechauffages": 0,
+        "prechauffages_rates": 0,
+        "prechauffages_inutiles": 0,
     }
 
 
@@ -96,6 +123,22 @@ def resumer(entrees):
             r["coupures"] += 1
             r["coupures_longues"] += duree > COUPURE_LONGUE
             r["coupure_max"] = max(r["coupure_max"], duree)
+            file = MOTIF_FILE_A_LA_COUPURE.search(message)
+            if file:
+                r["coupures_file_connue"] += 1
+                r["coupures_file_vide"] += int(file.group(1)) <= FILE_PRESQUE_VIDE
+            etat = MOTIF_ETAT_A_LA_COUPURE.search(message)
+            if etat:
+                r["etats_a_la_coupure"].append((float(etat.group(1)), int(etat.group(2)), int(etat.group(3))))
+        elif MOTIF_FILE.search(message):
+            file_max, perdus = map(int, MOTIF_FILE.search(message).groups())
+            r["file_max"] = file_max if r["file_max"] is None else max(r["file_max"], file_max)
+            r["blocs_perdus"] += perdus
+        elif message.startswith("[cache] "):
+            r["prechauffages"] += bool(MOTIF_PRECHAUFFAGE.search(message))
+            r["prechauffages_rates"] += message.startswith(("[cache] préchauffage raté", "[cache] préchauffage refusé",
+                                                            "[cache] préchauffage arrêté"))
+            r["prechauffages_inutiles"] += message.startswith("[cache] encore chaud")
         elif sante:
             valeurs = {nom: float(valeur) for nom, valeur in MOTIF_CHAMP.findall(sante.group(1)) if valeur != "?"}
             if seance is not None and seance["cle"] == cle:
@@ -114,6 +157,23 @@ def resumer(entrees):
             r["abandons"] += 1
         elif message.startswith("[mesure] fin de ta phrase"):
             r["phrases"] += 1
+            mesure = MOTIF_MESURE.search(message)
+            if mesure:
+                details = mesure.group(2)
+                premier_mot = MOTIF_PREMIER_MOT.search(details)
+                if premier_mot:
+                    r["premiers_mots"].append(float(premier_mot.group(1)))
+                # Les mesures d'avant l'étape 2 ne disent pas d'où elles partent : elles ne comptent pas dans les délais,
+                # car en mains libres elles oubliaient environ 1 s.
+                origine = MOTIF_ORIGINE.search(details)
+                if origine:
+                    r["delais"].setdefault(origine.group(1), []).append(float(mesure.group(1)))
+                    outil = MOTIF_OUTIL.search(details)
+                    r["delais_avec_outil" if outil else "delais_sans_outil"].append(float(mesure.group(1)))
+                    if outil:
+                        r["premiers_outils"].append(float(outil.group(1)))
+                        r["appels_max"] = max(r["appels_max"], int(outil.group(2)))
+                r["sons_d_attente"] += "son d'attente" in details
     return r
 
 
@@ -126,6 +186,14 @@ def _duree(secondes):
 
 def _evolution(valeurs):
     return f"de {valeurs[0]:.0f} à {valeurs[-1]:.0f} Mo" + (f", au plus {max(valeurs):.0f}" if max(valeurs) > valeurs[-1] else "")
+
+
+def _repartition(valeurs):
+    """Médiane, 9 sur 10 en dessous (à partir de 5 valeurs) et maximum, en secondes."""
+    texte = f"médiane {statistics.median(valeurs):.2f} s"
+    if len(valeurs) >= 5:
+        texte += f", 90 % sous {sorted(valeurs)[math.ceil(0.9 * len(valeurs)) - 1]:.2f} s"
+    return texte + f", au plus {max(valeurs):.2f} s ({len(valeurs)} phrase{'s' if len(valeurs) > 1 else ''})"
 
 
 def en_francais(r):
@@ -164,8 +232,20 @@ def en_francais(r):
     if r["coupures"]:
         lignes.append(f"Coupures du micro : {r['coupures']}, dont {r['coupures_longues']} de plus de {COUPURE_LONGUE / 1000:.1f} s, "
                       f"jusqu'à {r['coupure_max'] / 1000:.2f} s.")
+        if r["coupures_file_connue"]:
+            lignes.append(f"Au moment de ces coupures, la file du micro était presque vide {r['coupures_file_vide']} fois "
+                          f"sur {r['coupures_file_connue']} : Vosk suivait alors, la cause est ailleurs.")
+        if r["etats_a_la_coupure"]:
+            charges, dispos, echanges = zip(*r["etats_a_la_coupure"])
+            releves = [s["echange"] for seance in r["seances"] for s in seance["sante"] if "echange" in s]
+            lignes.append(f"Au moment des coupures : échange de {min(echanges)} à {max(echanges)} Mo"
+                          + (f" (de {min(releves):.0f} à {max(releves):.0f} Mo sur les relevés de santé)" if releves else "")
+                          + f", mémoire disponible {min(dispos)} Mo au plus bas, charge {max(charges):.2f} au plus.")
     else:
         lignes.append("Coupures du micro : aucune.")
+    if r["file_max"] is not None:
+        lignes.append(f"File du micro : jusqu'à {r['file_max']} blocs en attente ({r['file_max'] / 10:.1f} s de son), "
+                      f"{r['blocs_perdus']} bloc(s) perdu(s).")
     if r["erreurs"]:
         lignes.append("Erreurs : " + ", ".join(f"{nom} ({nombre} fois)" for nom, nombre in sorted(r["erreurs"].items())) + ".")
     else:
@@ -178,6 +258,22 @@ def en_francais(r):
     if r["abandons"]:
         lignes.append(f"Trop d'échecs d'affilée, retour à sa personnalité d'origine : {r['abandons']} fois.")
     lignes.append(f"Phrases auxquelles il a répondu : {r['phrases']}.")
+    for origine in ("la fin de ta voix", "le doigt levé", "le texte compris"):
+        if r["delais"].get(origine):
+            lignes.append(f"Délai de réponse, depuis {origine} : {_repartition(r['delais'][origine])}.")
+    if r["delais_avec_outil"]:
+        lignes.append(f"Délai de réponse quand Claude lance un geste ou un outil : {_repartition(r['delais_avec_outil'])}, "
+                      f"premier outil lancé en médiane {statistics.median(r['premiers_outils']):.2f} s après l'envoi, "
+                      f"jusqu'à {r['appels_max']} appels à Claude pour une phrase.")
+        if r["delais_sans_outil"]:
+            lignes.append(f"Délai de réponse sans geste ni outil : {_repartition(r['delais_sans_outil'])}.")
+    if r["premiers_mots"]:
+        lignes.append(f"Premier mot de Claude : {_repartition(r['premiers_mots'])}.")
+    if r["sons_d_attente"]:
+        lignes.append(f"Petit son d'attente : {r['sons_d_attente']} fois.")
+    if r["prechauffages"] or r["prechauffages_rates"] or r["prechauffages_inutiles"]:
+        lignes.append(f"Préchauffage du cache : {r['prechauffages']} fois, {r['prechauffages_rates']} raté(s), "
+                      f"{r['prechauffages_inutiles']} fois inutile car le cache était encore chaud.")
     if r["minutes_sur_base"] or r["minutes_hors_base"]:
         lignes.append(f"Sa place : {_duree(r['minutes_sur_base'] * 60)} sur sa base, {_duree(r['minutes_hors_base'] * 60)} hors de sa base.")
     if r["batterie_min"] is not None:
