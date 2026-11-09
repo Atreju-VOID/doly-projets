@@ -1728,6 +1728,10 @@ def essai_sante():
                   ("C", 1, 600.0, relevé.format(254, 440, "50.0", 595)),
                   ("C", 1, 2500.0, relevé.format(300, 400, "50.0", 2495))]
     verifier("dernière heure" not in resumer_journal.en_francais(resumer_journal.resumer(trop_court)), "pas de chiffre sur moins d'une heure")
+    # Vu sur le robot : juste après un lancement, le seul relevé a 0 s et le résumé plantait.
+    tout_juste = [("D", 1, 5.0, "[info] Prêt."),
+                  ("D", 1, 6.0, relevé.format(250, 444, "37.0", 0))]
+    verifier("dernière heure" not in resumer_journal.en_francais(resumer_journal.resumer(tout_juste)), "pas de plantage juste après un lancement")
     verifier("la mémoire disponible de 320 à 310 Mo" in texte, texte)
     verifier("55 °C" in texte, texte)
     verifier("Coupures du micro : 2, dont 1 de plus de 0.2 s, jusqu'à 0.25 s." in texte, texte)

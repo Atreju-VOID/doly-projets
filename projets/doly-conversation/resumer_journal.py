@@ -153,7 +153,8 @@ def en_francais(r):
             if relevés:
                 depuis = max(CHAUFFE, relevés[-1]["appli_depuis"] - 3600)
                 heure = [s for s in relevés if s["appli_depuis"] >= depuis]
-                if heure[-1]["appli_depuis"] - heure[0]["appli_depuis"] >= 3000:
+                # Juste après un lancement, aucun relevé n'a encore passé la chauffe.
+                if len(heure) >= 2 and heure[-1]["appli_depuis"] - heure[0]["appli_depuis"] >= 3000:
                     lignes.append(f"Sur la dernière heure : {heure[-1]['appli'] - heure[0]['appli']:+.0f} Mo pour l'appli.")
         else:
             lignes.append("Mémoire : pas de relevé de santé sur ce lancement.")
